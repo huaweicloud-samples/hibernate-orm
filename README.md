@@ -1,4 +1,4 @@
-# hibernate-orm7.4.1
+# hibernate-orm
 
 [![Status](https://img.shields.io/badge/Status-Incubating-blue)]()
 [![Huawei Cloud](https://img.shields.io/badge/Huawei%20Cloud-Samples-red)]()
