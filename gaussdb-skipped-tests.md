@@ -5,7 +5,7 @@
 
 ---
 
-## 一、A 模式不支持的功能（客户核心关注）
+## 一、A 模式不支持的功能
 
 A 模式（openGauss Oracle 兼容 / PG 内核）功能基本完整，仅以下不支持：
 
@@ -43,24 +43,7 @@ M 模式（MySQL 兼容内核）相对 PG 内核缺失较多，A 模式以下功
 
 ---
 
-## 三、本次 A 模式适配改动明细
-
-1. **GaussDBFunctionRegistry**：A 模式注册 hypothetical-set 聚合函数（rank / dense_rank / percent_rank / cume_dist），支持窗口（OVER）用法；M 模式不注册（M 不支持）。
-2. **6 处双模式 skip → M-only**（`@SkipForDialect(GaussDBDialect)` → `@RequiresDialectFeature(NotGaussDBMMode)`），A 模式跑通：
-   - `ColumnTransformerTest:43`（cast VARCHAR，类级 6 方法）
-   - `FunctionTests:646`（current_date）、`:1148`（cast binary）、`:2025`（timestampadd）
-   - `CriteriaWindowFunctionTest:239`（rank 窗口）、`:268`（percent_rank/cume_dist 窗口）
-3. **5 处 WITHIN GROUP 新增双模式 skip**（M+A 均不支持 within group）：
-   - `OrderedSetAggregateTest:169 / 180 / 191`
-   - `CriteriaOrderedSetAggregateTest:285 / 301`
-4. **3 处保持双模式**（A 也不支持，核实后未改）：
-   - `StructAggregateEmbeddableInheritanceTest:166`（struct 存储过程，gsjdbc4 OUT 参数）
-   - `KeywordRecognitionTests:27`（保留字 end，curated set）
-   - `JsonMappingTests:298`（json = 运算符）
-
----
-
-## 四、跳过统计
+## 三、跳过统计
 
 | 类别 | 方法数 | 说明 |
 |------|--------|------|
@@ -84,5 +67,4 @@ hibernate-core:test 报告总 skipped 中，我方新增约 65 个，其余为 H
 ## 六、结论
 
 1. **A 模式功能基本完整**：核心限制仅 ON CONFLICT（可用 ON DUPLICATE KEY 替代，仅含主键表 do-nothing upsert 除外）；hypothetical-set 仅窗口支持（within group 不支持）；struct 存储过程 / 保留字 end / json= 为 M+A 共同限制。
-2. **本次适配让 A 模式多跑 11 个测试方法**（cast / current_date / timestampadd / 窗口函数等），A 模式覆盖更完整。
-3. M 模式限制较多（MySQL 兼容内核相对 PG 内核缺失），均为内核限制，A 模式不受影响。
+2. M 模式限制较多（MySQL 兼容内核相对 PG 内核缺失），均为内核限制，A 模式不受影响。
