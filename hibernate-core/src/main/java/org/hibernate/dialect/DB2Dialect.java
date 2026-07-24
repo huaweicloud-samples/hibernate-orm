@@ -1,0 +1,1350 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright Red Hat Inc. and Hibernate Authors
+ */
+package org.hibernate.dialect;
+
+import jakarta.persistence.TemporalType;
+import jakarta.persistence.Timeout;
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.hibernate.Timeouts;
+import org.hibernate.boot.model.FunctionContributions;
+import org.hibernate.boot.model.TypeContributions;
+import org.hibernate.dialect.aggregate.AggregateSupport;
+import org.hibernate.dialect.aggregate.DB2AggregateSupport;
+import org.hibernate.dialect.function.CastingConcatFunction;
+import org.hibernate.dialect.function.CommonFunctionFactory;
+import org.hibernate.dialect.function.CountFunction;
+import org.hibernate.dialect.function.DB2FormatEmulation;
+import org.hibernate.dialect.function.DB2SubstringFunction;
+import org.hibernate.dialect.function.TrimFunction;
+import org.hibernate.dialect.identity.DB2IdentityColumnSupport;
+import org.hibernate.dialect.identity.IdentityColumnSupport;
+import org.hibernate.dialect.lock.internal.DB2LockingSupport;
+import org.hibernate.dialect.lock.spi.LockingSupport;
+import org.hibernate.dialect.pagination.DB2LimitHandler;
+import org.hibernate.dialect.pagination.LimitHandler;
+import org.hibernate.dialect.sequence.DB2SequenceSupport;
+import org.hibernate.dialect.sequence.SequenceSupport;
+import org.hibernate.dialect.sql.ast.DB2SqlAstTranslator;
+import org.hibernate.dialect.sql.ast.PostgreSQLSqlAstTranslator;
+import org.hibernate.dialect.temporal.DB2TemporalTableSupport;
+import org.hibernate.dialect.temporal.TemporalTableSupport;
+import org.hibernate.dialect.temptable.DB2GlobalTemporaryTableStrategy;
+import org.hibernate.dialect.temptable.TemporaryTableStrategy;
+import org.hibernate.dialect.type.DB2StructJdbcType;
+import org.hibernate.dialect.unique.AlterTableUniqueIndexDelegate;
+import org.hibernate.dialect.unique.UniqueDelegate;
+import org.hibernate.engine.jdbc.Size;
+import org.hibernate.engine.jdbc.dialect.spi.DialectResolutionInfo;
+import org.hibernate.engine.jdbc.env.spi.IdentifierHelper;
+import org.hibernate.engine.jdbc.env.spi.IdentifierHelperBuilder;
+import org.hibernate.engine.spi.SessionFactoryImplementor;
+import org.hibernate.exception.ConstraintViolationException;
+import org.hibernate.exception.ConstraintViolationException.ConstraintKind;
+import org.hibernate.exception.LockTimeoutException;
+import org.hibernate.exception.spi.SQLExceptionConversionDelegate;
+import org.hibernate.exception.spi.TemplatedViolatedConstraintNameExtractor;
+import org.hibernate.exception.spi.ViolatedConstraintNameExtractor;
+import org.hibernate.mapping.AggregateColumn;
+import org.hibernate.mapping.Column;
+import org.hibernate.mapping.Table;
+import org.hibernate.metamodel.mapping.EntityMappingType;
+import org.hibernate.metamodel.spi.RuntimeModelCreationContext;
+import org.hibernate.persister.entity.mutation.EntityMutationTarget;
+import org.hibernate.procedure.internal.DB2CallableStatementSupport;
+import org.hibernate.procedure.spi.CallableStatementSupport;
+import org.hibernate.query.common.TemporalUnit;
+import org.hibernate.query.sqm.CastType;
+import org.hibernate.query.sqm.IntervalType;
+import org.hibernate.query.sqm.mutation.internal.cte.CteInsertStrategy;
+import org.hibernate.query.sqm.mutation.internal.cte.CteMutationStrategy;
+import org.hibernate.query.sqm.mutation.spi.SqmMultiTableInsertStrategy;
+import org.hibernate.query.sqm.mutation.spi.SqmMultiTableMutationStrategy;
+import org.hibernate.query.sqm.produce.function.FunctionParameterType;
+import org.hibernate.service.ServiceRegistry;
+import org.hibernate.sql.ast.SqlAstNodeRenderingMode;
+import org.hibernate.sql.ast.SqlAstTranslator;
+import org.hibernate.sql.ast.SqlAstTranslatorFactory;
+import org.hibernate.sql.ast.spi.SqlAppender;
+import org.hibernate.sql.ast.spi.StandardSqlAstTranslatorFactory;
+import org.hibernate.sql.ast.tree.Statement;
+import org.hibernate.sql.exec.spi.JdbcOperation;
+import org.hibernate.sql.model.MutationOperation;
+import org.hibernate.sql.model.internal.OptionalTableUpdate;
+import org.hibernate.tool.schema.extract.internal.SequenceInformationExtractorDB2DatabaseImpl;
+import org.hibernate.tool.schema.extract.internal.SequenceInformationExtractorNoOpImpl;
+import org.hibernate.tool.schema.extract.spi.SequenceInformationExtractor;
+import org.hibernate.tool.schema.internal.StandardTableExporter;
+import org.hibernate.tool.schema.spi.Exporter;
+import org.hibernate.type.JavaObjectType;
+import org.hibernate.type.SqlTypes;
+import org.hibernate.type.StandardBasicTypes;
+import org.hibernate.type.descriptor.ValueExtractor;
+import org.hibernate.type.descriptor.java.JavaType;
+import org.hibernate.type.descriptor.java.PrimitiveByteArrayJavaType;
+import org.hibernate.type.descriptor.jdbc.InstantJdbcType;
+import org.hibernate.type.descriptor.jdbc.JdbcType;
+import org.hibernate.type.descriptor.jdbc.LocalDateJdbcType;
+import org.hibernate.type.descriptor.jdbc.LocalDateTimeJdbcType;
+import org.hibernate.type.descriptor.jdbc.LocalTimeJdbcType;
+import org.hibernate.type.descriptor.jdbc.ObjectNullResolvingJdbcType;
+import org.hibernate.type.descriptor.jdbc.OffsetDateTimeJdbcType;
+import org.hibernate.type.descriptor.jdbc.OffsetTimeJdbcType;
+import org.hibernate.type.descriptor.jdbc.XmlJdbcType;
+import org.hibernate.type.descriptor.jdbc.ZonedDateTimeJdbcType;
+import org.hibernate.type.descriptor.sql.internal.CapacityDependentDdlType;
+import org.hibernate.type.descriptor.sql.internal.DdlTypeImpl;
+import org.hibernate.type.spi.TypeConfiguration;
+
+import java.sql.CallableStatement;
+import java.sql.DatabaseMetaData;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Types;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.ZonedDateTime;
+import java.time.temporal.TemporalAccessor;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.List;
+import java.util.TimeZone;
+import java.util.regex.Pattern;
+
+import static java.lang.Integer.parseInt;
+import static org.hibernate.exception.spi.TemplatedViolatedConstraintNameExtractor.extractUsingTemplate;
+import static org.hibernate.internal.util.JdbcExceptionHelper.extractErrorCode;
+import static org.hibernate.type.SqlTypes.BINARY;
+import static org.hibernate.type.SqlTypes.BLOB;
+import static org.hibernate.type.SqlTypes.CLOB;
+import static org.hibernate.type.SqlTypes.DECIMAL;
+import static org.hibernate.type.SqlTypes.NUMERIC;
+import static org.hibernate.type.SqlTypes.SQLXML;
+import static org.hibernate.type.SqlTypes.TIME;
+import static org.hibernate.type.SqlTypes.TIMESTAMP_WITH_TIMEZONE;
+import static org.hibernate.type.SqlTypes.TIME_WITH_TIMEZONE;
+import static org.hibernate.type.SqlTypes.TINYINT;
+import static org.hibernate.type.SqlTypes.VARBINARY;
+import static org.hibernate.type.SqlTypes.VARCHAR;
+import static org.hibernate.type.descriptor.DateTimeUtils.appendAsDate;
+import static org.hibernate.type.descriptor.DateTimeUtils.appendAsLocalTime;
+import static org.hibernate.type.descriptor.DateTimeUtils.appendAsTimestampWithMillis;
+import static org.hibernate.type.descriptor.DateTimeUtils.appendAsTimestampWithNanos;
+
+/**
+ * A {@linkplain Dialect SQL dialect} for Db2 for LUW (Linux, Unix, and Windows) version 11.1 and above.
+ * <p>
+ * Please refer to the
+ * <a href="https://www.ibm.com/docs/en/db2/12.1">Db2 documentation</a>.
+ *
+ * @author Gavin King
+ *
+ * @see DB2iDialect
+ * @see DB2zDialect
+ */
+public class DB2Dialect extends Dialect {
+
+	final static DatabaseVersion MINIMUM_VERSION = DatabaseVersion.make( 11, 1 );
+
+	private static final Pattern DB2_VERSION_PATTERN = Pattern.compile( "(?:ARI|DSN|QSQ|SQL)(\\d\\d)(\\d\\d)(\\d)\\d?" );
+	private static final int BIND_PARAMETERS_NUMBER_LIMIT = 32_767;
+
+	private static final String FOR_READ_ONLY_SQL = " for read only with rs";
+	private static final String FOR_SHARE_SQL = FOR_READ_ONLY_SQL + " use and keep share locks";
+	private static final String FOR_UPDATE_SQL = FOR_READ_ONLY_SQL + " use and keep update locks";
+	private static final String SKIP_LOCKED_SQL = " skip locked data";
+	private static final String FOR_SHARE_SKIP_LOCKED_SQL = FOR_SHARE_SQL + SKIP_LOCKED_SQL;
+	private static final String FOR_UPDATE_SKIP_LOCKED_SQL = FOR_UPDATE_SQL + SKIP_LOCKED_SQL;
+
+	private final LimitHandler limitHandler = DB2LimitHandler.INSTANCE;
+	private final UniqueDelegate uniqueDelegate = createUniqueDelegate();
+	private final StandardTableExporter db2TableExporter = new StandardTableExporter( this ) {
+		@Override
+		protected void applyAggregateColumnCheck(StringBuilder buf, AggregateColumn aggregateColumn) {
+			final JdbcType jdbcType = aggregateColumn.getType().getJdbcType();
+			if ( !jdbcType.isLob() && !jdbcType.isXml() ) { // LOB or XML columns can't have check constraints
+				super.applyAggregateColumnCheck( buf, aggregateColumn );
+			}
+		}
+	};
+
+	private final LockingSupport lockingSupport;
+
+	public DB2Dialect() {
+		this( MINIMUM_VERSION );
+	}
+
+	public DB2Dialect(DialectResolutionInfo info) {
+		this( determinFullDatabaseVersion( info ) );
+		registerKeywords( info );
+	}
+
+	public DB2Dialect(DatabaseVersion version) {
+		super( version );
+		lockingSupport = buildLockingSupport();
+	}
+
+	@Override
+	public DatabaseVersion determineDatabaseVersion(DialectResolutionInfo info) {
+		return determinFullDatabaseVersion( info );
+	}
+
+	public static DatabaseVersion determinFullDatabaseVersion(DialectResolutionInfo info) {
+		String versionString = null;
+		final var databaseMetadata = info.getDatabaseMetadata();
+		if ( databaseMetadata != null ) {
+			try {
+				versionString = databaseMetadata.getDatabaseProductVersion();
+			}
+			catch (SQLException ex) {
+				// Ignore
+			}
+		}
+		final var databaseVersion = versionString == null ? null : parseVersion( versionString );
+		return databaseVersion != null ? databaseVersion : info.makeCopyOrDefault( MINIMUM_VERSION );
+	}
+
+	public static @Nullable DatabaseVersion parseVersion(String versionString) {
+		if ( versionString.length() != 9 ) {
+			// The default format
+			return null;
+		}
+		else {
+			final var matcher = DB2_VERSION_PATTERN.matcher( versionString );
+			if ( matcher.find() ) {
+				final int majorVersion = parseInt( matcher.group( 1 ) );
+				final int minorVersion = parseInt( matcher.group( 2 ) );
+				final int microVersion = parseInt( matcher.group( 3 ) );
+				return new SimpleDatabaseVersion( majorVersion, minorVersion, microVersion );
+			}
+			else {
+				return null;
+			}
+		}
+	}
+
+	protected LockingSupport buildLockingSupport() {
+		// Introduced in 11.5: https://www.ibm.com/docs/en/db2/11.5?topic=statement-concurrent-access-resolution-clause
+		final boolean supportsSkipLocked = getVersion().isSameOrAfter( 11, 5 );
+		return DB2LockingSupport.forDB2( supportsSkipLocked );
+	}
+
+	@Override
+	protected DatabaseVersion getMinimumSupportedVersion() {
+		return MINIMUM_VERSION;
+	}
+
+	/**
+	 * DB2 LUW Version
+	 */
+	public DatabaseVersion getDB2Version() {
+		return this.getVersion();
+	}
+
+	@Override
+	public Exporter<Table> getTableExporter() {
+		return this.db2TableExporter;
+	}
+
+	@Override
+	public int getDefaultStatementBatchSize() {
+		return 0;
+	}
+
+	@Override
+	protected String columnType(int sqlTypeCode) {
+		return switch (sqlTypeCode) {
+			case TINYINT -> "smallint"; // no tinyint
+
+			// HHH-12827: map them both to the same type to avoid problems with schema update
+			// Note that 31 is the maximum precision DB2 supports
+			case NUMERIC -> columnType( DECIMAL );
+
+			case BLOB -> "blob";
+			case CLOB -> "clob";
+
+			case TIMESTAMP_WITH_TIMEZONE -> "timestamp($p)";
+			case TIME, TIME_WITH_TIMEZONE -> "time";
+
+			default -> super.columnType( sqlTypeCode );
+		};
+	}
+
+	@Override
+	protected void registerColumnTypes(TypeContributions typeContributions, ServiceRegistry serviceRegistry) {
+		super.registerColumnTypes( typeContributions, serviceRegistry );
+		final var ddlTypeRegistry = typeContributions.getTypeConfiguration().getDdlTypeRegistry();
+
+		ddlTypeRegistry.addDescriptor( new DdlTypeImpl( SQLXML, "xml", this ) );
+		ddlTypeRegistry.addDescriptor(
+				CapacityDependentDdlType.builder( BINARY, columnType( VARBINARY ), this )
+						.withTypeCapacity( 254, columnType( BINARY ) )
+						.build()
+		);
+	}
+
+	@Override
+	public MutationOperation createOptionalTableUpdateOperation(
+			EntityMutationTarget mutationTarget,
+			OptionalTableUpdate optionalTableUpdate,
+			SessionFactoryImplementor factory) {
+		return new PostgreSQLSqlAstTranslator<>( factory, optionalTableUpdate )
+				.createMergeOperation( optionalTableUpdate );
+	}
+	protected UniqueDelegate createUniqueDelegate() {
+		return new AlterTableUniqueIndexDelegate( this );
+	}
+
+	@Override
+	public int getMaxVarcharLength() {
+		return 32_672;
+	}
+
+	@Override
+	public int getDefaultDecimalPrecision() {
+		//this is the maximum allowed in DB2
+		return 31;
+	}
+
+	@Override
+	public boolean supportsUserDefinedTypes() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsDistinctFromPredicate() {
+		return true;
+	}
+
+	@Override
+	public void initializeFunctionRegistry(FunctionContributions functionContributions) {
+		super.initializeFunctionRegistry( functionContributions );
+
+		final var ddlTypeRegistry = functionContributions.getTypeConfiguration().getDdlTypeRegistry();
+		final var functionFactory = new CommonFunctionFactory( functionContributions );
+		// AVG by default uses the input type, so we possibly need to cast the argument type, hence a special function
+		functionFactory.avg_castingNonDoubleArguments( this, SqlAstNodeRenderingMode.DEFAULT );
+
+		functionFactory.cot();
+		functionFactory.sinh();
+		functionFactory.cosh();
+		functionFactory.tanh();
+		functionFactory.degrees();
+		functionFactory.log10();
+		functionFactory.radians();
+		functionFactory.rand();
+		functionFactory.soundex();
+		functionFactory.trim2();
+		functionFactory.space();
+		functionFactory.repeat();
+		functionContributions.getFunctionRegistry().namedDescriptorBuilder( "substr" )
+				.setInvariantType(
+						functionContributions.getTypeConfiguration().getBasicTypeRegistry().resolve( StandardBasicTypes.STRING )
+				)
+				.setArgumentCountBetween( 2, 3 )
+				.setParameterTypes(FunctionParameterType.STRING, FunctionParameterType.INTEGER, FunctionParameterType.INTEGER)
+				.setArgumentListSignature( "(STRING string, INTEGER start[, INTEGER length])" )
+				.register();
+		functionContributions.getFunctionRegistry().register(
+				"substring",
+				new DB2SubstringFunction( functionContributions.getTypeConfiguration() )
+		);
+		functionFactory.translate();
+		functionFactory.bitand();
+		functionFactory.bitor();
+		functionFactory.bitxor();
+		functionFactory.bitnot();
+		functionFactory.yearMonthDay();
+		functionFactory.hourMinuteSecond();
+		functionFactory.dayofweekmonthyear();
+		functionFactory.weekQuarter();
+		functionFactory.daynameMonthname();
+		functionFactory.lastDay();
+		functionFactory.toCharNumberDateTimestamp();
+		functionFactory.dateTimeTimestamp();
+		functionFactory.concat_pipeOperator();
+		functionFactory.octetLength();
+		functionFactory.ascii();
+		functionFactory.char_chr();
+		functionFactory.insert();
+		functionFactory.characterLength_length( SqlAstNodeRenderingMode.DEFAULT );
+		functionFactory.stddev();
+		functionFactory.regrLinearRegressionAggregates();
+		functionFactory.variance();
+		functionFactory.hypotheticalOrderedSetAggregates_windowEmulation();
+		functionFactory.position();
+		functionFactory.overlayLength_overlay( false );
+		functionFactory.median();
+		functionFactory.inverseDistributionOrderedSetAggregates();
+		functionFactory.stddevPopSamp();
+		functionFactory.varPopSamp();
+		functionFactory.varianceSamp();
+		functionFactory.dateTrunc();
+		functionFactory.trunc_dateTrunc();
+
+		functionFactory.addYearsMonthsDaysHoursMinutesSeconds();
+		functionFactory.yearsMonthsDaysHoursMinutesSecondsBetween();
+		functionFactory.bitLength_pattern( "length(?1)*8" );
+
+		// DB2 wants parameter operands to be casted to allow lengths bigger than 255
+		functionContributions.getFunctionRegistry().register(
+				"concat",
+				new CastingConcatFunction(
+						this,
+						"||",
+						true,
+						SqlAstNodeRenderingMode.NO_PLAIN_PARAMETER,
+						functionContributions.getTypeConfiguration()
+				)
+		);
+		// For the count distinct emulation distinct
+		functionContributions.getFunctionRegistry().register(
+				"count",
+				new CountFunction(
+						this,
+						functionContributions.getTypeConfiguration(),
+						SqlAstNodeRenderingMode.DEFAULT,
+						"||",
+						ddlTypeRegistry.getDescriptor( VARCHAR )
+								.getCastTypeName(
+										Size.nil(),
+										functionContributions.getTypeConfiguration()
+												.getBasicTypeRegistry()
+												.resolve( StandardBasicTypes.STRING ),
+										ddlTypeRegistry
+								),
+						true
+				)
+		);
+
+		functionContributions.getFunctionRegistry().register(
+				"format",
+				new DB2FormatEmulation( functionContributions.getTypeConfiguration() )
+		);
+
+		functionContributions.getFunctionRegistry().patternDescriptorBuilder( "atan2", "atan2(?2,?1)" )
+				.setInvariantType(
+						functionContributions.getTypeConfiguration().getBasicTypeRegistry().resolve( StandardBasicTypes.DOUBLE )
+				)
+				.setExactArgumentCount( 2 )
+				.setParameterTypes( FunctionParameterType.NUMERIC, FunctionParameterType.NUMERIC )
+				.register();
+
+		functionContributions.getFunctionRegistry().namedDescriptorBuilder( "posstr" )
+				.setInvariantType(
+						functionContributions.getTypeConfiguration().getBasicTypeRegistry().resolve( StandardBasicTypes.INTEGER )
+				)
+				.setExactArgumentCount( 2 )
+				.setParameterTypes(FunctionParameterType.STRING, FunctionParameterType.STRING)
+				.setArgumentListSignature("(STRING string, STRING pattern)")
+				.register();
+
+		//trim() requires trim characters to be constant literals
+		functionContributions.getFunctionRegistry().register( "trim", new TrimFunction(
+				this,
+				functionContributions.getTypeConfiguration(),
+				SqlAstNodeRenderingMode.INLINE_PARAMETERS
+		) );
+
+		functionFactory.windowFunctions();
+		functionFactory.listagg( null );
+
+		registerJsonFunctions( functionFactory );
+		registerXmlFunctions( functionFactory );
+
+		functionFactory.unnest_db2( getMaximumSeriesSize() );
+		functionFactory.generateSeries_recursive( getMaximumSeriesSize(), false, true );
+
+		functionFactory.hex( "hex(?1)" );
+		functionFactory.sha( "hash(?1, 2)" );
+		functionFactory.md5( "hash(?1, 0)" );
+
+		functionFactory.regexpLike();
+	}
+
+	protected static void registerXmlFunctions(CommonFunctionFactory functionFactory) {
+		functionFactory.xmlelement();
+		functionFactory.xmlcomment();
+		functionFactory.xmlforest();
+		functionFactory.xmlconcat();
+		functionFactory.xmlpi();
+		functionFactory.xmlquery_db2();
+		functionFactory.xmlexists();
+		functionFactory.xmlagg();
+		functionFactory.xmltable_db2();
+	}
+
+	protected void registerJsonFunctions(CommonFunctionFactory functionFactory) {
+		functionFactory.jsonValue_db2();
+		functionFactory.jsonQuery_no_passing();
+		functionFactory.jsonExists_no_passing();
+		functionFactory.jsonObject_db2();
+		functionFactory.jsonArray_db2();
+		functionFactory.jsonArrayAgg_db2();
+		functionFactory.jsonObjectAgg_db2();
+		functionFactory.jsonTable_db2( getMaximumSeriesSize() );
+	}
+
+	/**
+	 * DB2 doesn't support the {@code generate_series} function or {@code lateral} recursive CTEs,
+	 * so it has to be emulated with a top level recursive CTE which requires an upper bound on the amount
+	 * of elements that the series can return.
+	 */
+	protected int getMaximumSeriesSize() {
+		return 10000;
+	}
+
+	@Override
+	public int getPreferredSqlTypeCodeForArray() {
+		// Even if DB2 11 supports JSON functions, it's not possible to unnest a JSON array to rows, so stick to XML
+		return SqlTypes.XML_ARRAY;
+	}
+
+	@Override
+	public String[] getDropSchemaCommand(String schemaName) {
+		return new String[] {"drop schema " + schemaName + " restrict"};
+	}
+
+	/**
+	 * Since we're using {@code seconds_between()} and
+	 * {@code add_seconds()}, it makes sense to use
+	 * seconds as the "native" precision.
+	 */
+	@Override
+	public long getFractionalSecondPrecisionInNanos() {
+		//Note that DB2 actually supports all the way up to
+		//thousands-of-nanoseconds precision for timestamps!
+		//i.e. timestamp(12)
+		return 1_000_000_000; //seconds
+	}
+
+	@Override @SuppressWarnings("deprecation")
+	public String timestampdiffPattern(TemporalUnit unit, TemporalType fromTemporalType, TemporalType toTemporalType) {
+		final var pattern = new StringBuilder();
+		final String fromExpression;
+		final String toExpression;
+		if ( unit.isDateUnit() ) {
+			fromExpression = "?2";
+			toExpression = "?3";
+		}
+		else {
+			fromExpression = switch (fromTemporalType) {
+				case DATE -> "cast(?2 as timestamp)";
+				case TIME -> "timestamp('1970-01-01',?2)";
+				default -> "?2";
+			};
+			toExpression = switch (toTemporalType) {
+				case DATE -> "cast(?3 as timestamp)";
+				case TIME -> "timestamp('1970-01-01',?3)";
+				default -> "?3";
+			};
+		}
+		switch ( unit ) {
+			case NATIVE:
+			case NANOSECOND:
+				pattern.append( "(seconds_between(date_trunc('second'," );
+				pattern.append( toExpression );
+				pattern.append( "),date_trunc('second'," );
+				pattern.append( fromExpression );
+				pattern.append( "))" );
+				break;
+			//note: DB2 does have weeks_between()
+			case MONTH:
+			case QUARTER:
+				// the months_between() function results
+				// in a non-integral value, so trunc() it
+				pattern.append( "trunc(months_between(" );
+				pattern.append( toExpression );
+				pattern.append( ',' );
+				pattern.append( fromExpression );
+				pattern.append( ')' );
+				break;
+			default:
+				pattern.append( "?1s_between(" );
+				pattern.append( toExpression );
+				pattern.append( ',' );
+				pattern.append( fromExpression );
+				pattern.append( ')' );
+		}
+		switch ( unit ) {
+			case NATIVE:
+				pattern.append( "+(microsecond(");
+				pattern.append( toExpression );
+				pattern.append(")-microsecond(");
+				pattern.append( fromExpression );
+				pattern.append("))/1e6)" );
+				break;
+			case NANOSECOND:
+				pattern.append( "*1e9+(microsecond(");
+				pattern.append( toExpression );
+				pattern.append(")-microsecond(");
+				pattern.append( fromExpression );
+				pattern.append("))*1e3)" );
+				break;
+			case MONTH:
+				pattern.append( ')' );
+				break;
+			case QUARTER:
+				pattern.append( "/3)" );
+				break;
+		}
+		return pattern.toString();
+	}
+
+	@Override @SuppressWarnings("deprecation")
+	public String timestampaddPattern(TemporalUnit unit, TemporalType temporalType, IntervalType intervalType) {
+		final var pattern = new StringBuilder();
+		final String timestampExpression;
+		if ( unit.isDateUnit() ) {
+			if ( temporalType == TemporalType.TIME ) {
+				timestampExpression = "timestamp('1970-01-01',?3)";
+			}
+			else {
+				timestampExpression = "?3";
+			}
+		}
+		else {
+			if ( temporalType == TemporalType.DATE ) {
+				timestampExpression = "cast(?3 as timestamp)";
+			}
+			else {
+				timestampExpression = "?3";
+			}
+		}
+		pattern.append(timestampExpression);
+		pattern.append("+(");
+		// DB2 supports temporal arithmetic. See https://www.ibm.com/support/knowledgecenter/en/SSEPGG_9.7.0/com.ibm.db2.luw.sql.ref.doc/doc/r0023457.html
+		switch (unit) {
+			case NATIVE:
+				// AFAICT the native format is seconds with fractional parts after the decimal point
+				pattern.append("?2) seconds");
+				break;
+			case NANOSECOND:
+				pattern.append("(?2)/1e9) seconds");
+				break;
+			case WEEK:
+				pattern.append("(?2)*7) days");
+				break;
+			case QUARTER:
+				pattern.append("(?2)*3) months");
+				break;
+			default:
+				pattern.append("?2) ?1s");
+		}
+		return pattern.toString();
+	}
+
+	@Override
+	public void appendDateTimeLiteral(
+			SqlAppender appender,
+			TemporalAccessor temporalAccessor,
+			@SuppressWarnings("deprecation")
+			TemporalType precision,
+			TimeZone jdbcTimeZone) {
+		switch ( precision ) {
+			case DATE:
+				appender.appendSql( "date '" );
+				appendAsDate( appender, temporalAccessor );
+				appender.appendSql( '\'' );
+				break;
+			case TIME:
+				appender.appendSql( "time '" );
+				appendAsLocalTime( appender, temporalAccessor );
+				appender.appendSql( '\'' );
+				break;
+			case TIMESTAMP:
+				appender.appendSql( "timestamp '" );
+				appendAsTimestampWithNanos( appender, temporalAccessor, false, jdbcTimeZone );
+				appender.appendSql( '\'' );
+				break;
+			default:
+				throw new IllegalArgumentException();
+		}
+	}
+
+	@Override
+	public void appendDateTimeLiteral(
+			SqlAppender appender,
+			Date date,
+			@SuppressWarnings("deprecation")
+			TemporalType precision,
+			TimeZone jdbcTimeZone) {
+		switch ( precision ) {
+			case DATE:
+				appender.appendSql( "date '" );
+				appendAsDate( appender, date );
+				appender.appendSql( '\'' );
+				break;
+			case TIME:
+				appender.appendSql( "time '" );
+				appendAsLocalTime( appender, date );
+				appender.appendSql( '\'' );
+				break;
+			case TIMESTAMP:
+				appender.appendSql( "timestamp '" );
+				appendAsTimestampWithNanos( appender, date, jdbcTimeZone );
+				appender.appendSql( '\'' );
+				break;
+			default:
+				throw new IllegalArgumentException();
+		}
+	}
+
+	@Override
+	public void appendDateTimeLiteral(
+			SqlAppender appender,
+			Calendar calendar,
+			@SuppressWarnings("deprecation")
+			TemporalType precision,
+			TimeZone jdbcTimeZone) {
+		switch ( precision ) {
+			case DATE:
+				appender.appendSql( "date '" );
+				appendAsDate( appender, calendar );
+				appender.appendSql( '\'' );
+				break;
+			case TIME:
+				appender.appendSql( "time '" );
+				appendAsLocalTime( appender, calendar );
+				appender.appendSql( '\'' );
+				break;
+			case TIMESTAMP:
+				appender.appendSql( "timestamp '" );
+				appendAsTimestampWithMillis( appender, calendar, jdbcTimeZone );
+				appender.appendSql( '\'' );
+				break;
+			default:
+				throw new IllegalArgumentException();
+		}
+	}
+
+	@Override
+	public boolean dropConstraints() {
+		return false;
+	}
+
+	@Override
+	public String getCreateIndexTail(boolean unique, List<Column> columns) {
+		return unique ? " exclude null keys" : "";
+	}
+
+	@Override
+	public SequenceSupport getSequenceSupport() {
+		return DB2SequenceSupport.INSTANCE;
+	}
+
+	@Override
+	public String getQuerySequencesString() {
+		return "select * from syscat.sequences";
+	}
+
+	@Override
+	public SequenceInformationExtractor getSequenceInformationExtractor() {
+		if ( getQuerySequencesString() == null ) {
+			return SequenceInformationExtractorNoOpImpl.INSTANCE;
+		}
+		else {
+			return SequenceInformationExtractorDB2DatabaseImpl.INSTANCE;
+		}
+	}
+
+	@Override
+	public LockingSupport getLockingSupport() {
+		return lockingSupport;
+	}
+
+	@Override
+	public String getForUpdateString() {
+		return FOR_UPDATE_SQL;
+	}
+
+	@Override
+	public String getForUpdateSkipLockedString() {
+		return supportsSkipLocked()
+				? FOR_UPDATE_SKIP_LOCKED_SQL
+				: FOR_UPDATE_SQL;
+	}
+
+	@Override
+	public String getForUpdateSkipLockedString(String aliases) {
+		return getForUpdateSkipLockedString();
+	}
+
+	@Override
+	public String getWriteLockString(Timeout timeout) {
+		return timeout.milliseconds() == Timeouts.SKIP_LOCKED_MILLI && supportsSkipLocked()
+				? FOR_UPDATE_SKIP_LOCKED_SQL
+				: FOR_UPDATE_SQL;
+	}
+
+	@Override
+	public String getReadLockString(Timeout timeout) {
+		return timeout.milliseconds() == Timeouts.SKIP_LOCKED_MILLI && supportsSkipLocked()
+				? FOR_SHARE_SKIP_LOCKED_SQL
+				: FOR_SHARE_SQL;
+	}
+
+	@Override
+	public String getWriteLockString(int timeout) {
+		return timeout == Timeouts.SKIP_LOCKED_MILLI && supportsSkipLocked()
+				? FOR_UPDATE_SKIP_LOCKED_SQL
+				: FOR_UPDATE_SQL;
+	}
+
+	@Override
+	public String getReadLockString(int timeout) {
+		return timeout == Timeouts.SKIP_LOCKED_MILLI && supportsSkipLocked()
+				? FOR_SHARE_SKIP_LOCKED_SQL
+				: FOR_SHARE_SQL;
+	}
+
+	@Override
+	public boolean supportsExistsInSelect() {
+		return false;
+	}
+
+	@Override
+	public boolean requiresCastForConcatenatingNonStrings() {
+		return true;
+	}
+
+	@Override
+	public String getSelectClauseNullString(int sqlType, TypeConfiguration typeConfiguration) {
+		return selectNullString(sqlType);
+	}
+
+	public static String selectNullString(int sqlType) {
+		final String literal = switch (sqlType) {
+			case Types.VARCHAR, Types.CHAR -> "''";
+			case Types.DATE -> "'2000-1-1'";
+			case Types.TIME -> "'00:00:00'";
+			case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> "'2000-1-1 00:00:00'";
+			default -> "0";
+		};
+		return "nullif(" + literal + "," + literal + ')';
+	}
+
+	@Override
+	public Boolean supportsRefCursors() {
+		// DB2 supports the binding with Types.REF_CURSOR but doesn't support statement.getObject(position, ResultSet.class)
+		return false;
+	}
+
+	@Override
+	public int registerResultSetOutParameter(CallableStatement statement, int col) throws SQLException {
+		statement.registerOutParameter( col++, Types.REF_CURSOR );
+		return col;
+	}
+
+	@Override
+	public int registerResultSetOutParameter(CallableStatement statement, String name) throws SQLException {
+		statement.registerOutParameter( name, Types.REF_CURSOR );
+		return 1;
+	}
+
+	@Override
+	public ResultSet getResultSet(CallableStatement ps) throws SQLException {
+		boolean isResultSet = ps.execute();
+		// This assumes you will want to ignore any update counts
+		while ( !isResultSet && ps.getUpdateCount() != -1 ) {
+			isResultSet = ps.getMoreResults();
+		}
+
+		return ps.getResultSet();
+	}
+
+	@Override
+	public ResultSet getResultSet(CallableStatement statement, int position) throws SQLException {
+		return (ResultSet) statement.getObject( position );
+	}
+
+	@Override
+	public ResultSet getResultSet(CallableStatement statement, String name) throws SQLException {
+		return (ResultSet) statement.getObject( name );
+	}
+
+	@Override
+	public boolean supportsCommentOn() {
+		return true;
+	}
+
+	@Override
+	public String getAlterColumnTypeString(String columnName, String columnType, String columnDefinition) {
+		// would need multiple statements to 'set not null'/'drop not null', 'set default'/'drop default', 'set generated', etc
+		return "alter column " + columnName + " set data type " + columnType;
+	}
+
+	@Override
+	public boolean supportsAlterColumnType() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsIfExistsBeforeTableName() {
+		return getVersion().isSameOrAfter( 11, 5 );
+	}
+
+	@Override
+	public boolean supportsIfExistsBeforeIndexName() {
+		return getVersion().isSameOrAfter( 11, 5 );
+	}
+
+	@Override
+	public SqmMultiTableMutationStrategy getFallbackSqmMutationStrategy(
+			EntityMappingType rootEntityDescriptor,
+			RuntimeModelCreationContext runtimeModelCreationContext) {
+		return new CteMutationStrategy( rootEntityDescriptor, runtimeModelCreationContext );
+	}
+
+	@Override
+	public SqmMultiTableInsertStrategy getFallbackSqmInsertStrategy(
+			EntityMappingType rootEntityDescriptor,
+			RuntimeModelCreationContext runtimeModelCreationContext) {
+		return new CteInsertStrategy( rootEntityDescriptor, runtimeModelCreationContext );
+	}
+
+	@Override
+	public TemporaryTableStrategy getGlobalTemporaryTableStrategy() {
+		return DB2GlobalTemporaryTableStrategy.INSTANCE;
+	}
+
+	@Override
+	public boolean supportsIsTrue() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsCurrentTimestampSelection() {
+		return true;
+	}
+
+	@Override
+	public String getCurrentTimestampSelectString() {
+		return "values current timestamp";
+	}
+
+	@Override
+	public boolean doesRoundTemporalOnOverflow() {
+		// DB2 does truncation
+		return false;
+	}
+
+	@Override
+	public boolean isCurrentTimestampSelectStringCallable() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsResultSetPositionQueryMethodsOnForwardOnlyCursor() {
+		return false;
+	}
+
+
+	// Overridden informational metadata ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+	@Override
+	public boolean supportsLobValueChangePropagation() {
+		return false;
+	}
+
+	@Override
+	public boolean useConnectionToCreateLob() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsNationalizedMethods() {
+		// See HHH-12753, HHH-18314, HHH-19201
+		// Old DB2 JDBC drivers do not support setNClob, setNCharcterStream or setNString.
+		// In more recent driver versions, some methods just delegate to the non-N variant, but others still fail.
+		// Ultimately, let's just avoid the N variant methods on DB2 altogether
+		return false;
+	}
+
+	@Override
+	public boolean doesReadCommittedCauseWritersToBlockReaders() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsTupleDistinctCounts() {
+		return false;
+	}
+
+	@Override
+	public void contributeTypes(TypeContributions typeContributions, ServiceRegistry serviceRegistry) {
+		super.contributeTypes( typeContributions, serviceRegistry );
+
+		final var jdbcTypeRegistry = typeContributions.getTypeConfiguration().getJdbcTypeRegistry();
+
+		jdbcTypeRegistry.addDescriptor( XmlJdbcType.INSTANCE );
+		jdbcTypeRegistry.addDescriptor( DB2StructJdbcType.INSTANCE );
+
+		// DB2 requires a custom binder for binding untyped nulls that resolves the type through the statement
+		typeContributions.contributeJdbcType( ObjectNullResolvingJdbcType.INSTANCE );
+
+		// Until we remove StandardBasicTypes, we have to keep this
+		typeContributions.contributeType(
+				new JavaObjectType(
+						ObjectNullResolvingJdbcType.INSTANCE,
+						typeContributions.getTypeConfiguration()
+								.getJavaTypeRegistry()
+								.resolveDescriptor( Object.class )
+				)
+		);
+
+		typeContributions.contributeJdbcType( new InstantJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, Instant.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new LocalDateTimeJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, LocalDateTime.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new LocalDateJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, LocalDate.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new LocalTimeJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, LocalTime.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new OffsetDateTimeJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, OffsetDateTime.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new OffsetTimeJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, OffsetTime.class );
+			}
+		} );
+		typeContributions.contributeJdbcType( new ZonedDateTimeJdbcType() {
+			@Override
+			public <X> ValueExtractor<X> getExtractor(JavaType<X> javaType) {
+				return new DB2GetObjectExtractor<>( javaType, this, ZonedDateTime.class );
+			}
+		} );
+	}
+
+	@Override
+	public AggregateSupport getAggregateSupport() {
+		return DB2AggregateSupport.JSON_INSTANCE;
+	}
+
+	@Override
+	public CallableStatementSupport getCallableStatementSupport() {
+		return DB2CallableStatementSupport.INSTANCE;
+	}
+
+	@Override
+	public void appendBinaryLiteral(SqlAppender appender, byte[] bytes) {
+		appender.appendSql( "BX'" );
+		PrimitiveByteArrayJavaType.INSTANCE.appendString( appender, bytes );
+		appender.appendSql( '\'' );
+	}
+
+	@Override
+	public ViolatedConstraintNameExtractor getViolatedConstraintNameExtractor() {
+		return new TemplatedViolatedConstraintNameExtractor(
+				sqle -> switch ( extractErrorCode( sqle ) ) {
+					case -803 -> {
+						// Unique constraint
+						final String constraintWithKind = extractUsingTemplate( "SQLERRMC=", ",", sqle.getMessage() );
+						// strip off "1;" for PK, or "2;" for other UK
+						yield constraintWithKind == null ? null : constraintWithKind.substring(2);
+					}
+					case -543, -545, -530,-531 ->
+						// Foreign key or check constraint
+							extractUsingTemplate( "SQLERRMC=", ",", sqle.getMessage() );
+					default -> null;
+				}
+		);
+	}
+
+	@Override
+	public SQLExceptionConversionDelegate buildSQLExceptionConversionDelegate() {
+		return (sqlException, message, sql) ->
+				switch ( extractErrorCode( sqlException ) ) {
+					case -952 ->
+							new LockTimeoutException( message, sqlException, sql );
+					case -803 ->
+							new ConstraintViolationException( message, sqlException, sql, ConstraintKind.UNIQUE,
+									getViolatedConstraintNameExtractor().extractConstraintName( sqlException ) );
+					case -530,-531 ->
+							new ConstraintViolationException( message, sqlException, sql, ConstraintKind.FOREIGN_KEY,
+									getViolatedConstraintNameExtractor().extractConstraintName( sqlException ) );
+					case -407 ->
+							new ConstraintViolationException( message, sqlException, sql, ConstraintKind.NOT_NULL,
+									getViolatedConstraintNameExtractor().extractConstraintName( sqlException ) );
+					case -543,-545 ->
+							new ConstraintViolationException( message, sqlException, sql, ConstraintKind.CHECK,
+									getViolatedConstraintNameExtractor().extractConstraintName( sqlException ) );
+					default -> null;
+				};
+	}
+
+	@Override
+	public UniqueDelegate getUniqueDelegate() {
+		return uniqueDelegate;
+	}
+
+	@Override
+	public int getMaxIdentifierLength() {
+		return 128;
+	}
+
+	@Override
+	public LimitHandler getLimitHandler() {
+		return limitHandler;
+	}
+
+	@Override
+	public boolean supportsNullPrecedence() {
+		return false;
+	}
+
+	@Override
+	public SqlAstTranslatorFactory getSqlAstTranslatorFactory() {
+		return new StandardSqlAstTranslatorFactory() {
+			@Override
+			protected <T extends JdbcOperation> SqlAstTranslator<T> buildTranslator(
+					SessionFactoryImplementor sessionFactory, Statement statement) {
+				return new DB2SqlAstTranslator<>( sessionFactory, statement );
+			}
+		};
+	}
+
+	@Override
+	public IdentityColumnSupport getIdentityColumnSupport() {
+		return DB2IdentityColumnSupport.INSTANCE;
+	}
+
+	/**
+	 * @return {@code true} because we can use {@code select ... from new table (insert .... )}
+	 */
+	@Override
+	public boolean supportsInsertReturning() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsInsertReturningRowId() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsValuesList() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsPartitionBy() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsNonQueryWithCTE() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsRecursiveCTE() {
+		// Supported at last since 9.7
+		return true;
+	}
+
+	@Override
+	public boolean supportsOffsetInSubquery() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsWindowFunctions() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsLateral() {
+		return true;
+	}
+
+	@Override
+	public void appendDatetimeFormat(SqlAppender appender, String format) {
+		//DB2 does not need nor support FM
+		appender.appendSql( OracleDialect.datetimeFormat( format, false, false ).result() );
+	}
+
+	@Override
+	public String translateExtractField(TemporalUnit unit) {
+		return switch (unit) {
+			//WEEK means the ISO week number on DB2
+			case DAY_OF_MONTH -> "day";
+			case DAY_OF_YEAR -> "doy";
+			case DAY_OF_WEEK -> "dow";
+			default -> super.translateExtractField( unit );
+		};
+	}
+
+	@Override
+	public void appendBooleanValueString(SqlAppender appender, boolean bool) {
+		appender.appendSql( bool );
+	}
+
+	@Override
+	public String extractPattern(TemporalUnit unit) {
+		switch ( unit ) {
+			case WEEK:
+				// Not sure why, but `extract(week from '2019-05-27')`
+				// wrongly returns 21 and week_iso behaves correct
+				return "week_iso(?2)";
+			case DAY_OF_YEAR:
+				return "dayofyear(?2)";
+			case DAY_OF_WEEK:
+				return "dayofweek(?2)";
+			case QUARTER:
+				return "quarter(?2)";
+		}
+		return super.extractPattern( unit );
+	}
+
+	@Override
+	public String castPattern(CastType from, CastType to) {
+		return from == CastType.STRING && to == CastType.BOOLEAN
+				? "cast(?1 as ?2)"
+				: super.castPattern( from, to );
+	}
+
+	@Override
+	public int getInExpressionCountLimit() {
+		return BIND_PARAMETERS_NUMBER_LIMIT;
+	}
+
+	@Override
+	public String generatedAs(String generatedAs) {
+		return switch ( generatedAs ) {
+			case "transaction start id" -> " not null generated always as transaction start id";
+			case "row start" -> " not null generated always as row begin";
+			case "row end" -> " not null generated always as row end";
+			default -> " generated always as (" + generatedAs + ")";
+		};
+	}
+
+	@Override
+	public IdentifierHelper buildIdentifierHelper(IdentifierHelperBuilder builder, DatabaseMetaData metadata)
+			throws SQLException {
+		builder.setAutoQuoteInitialUnderscore( true );
+		return super.buildIdentifierHelper( builder, metadata );
+	}
+
+	@Override
+	public boolean canDisableConstraints() {
+		return true;
+	}
+
+	@Override
+	public String getDisableConstraintStatement(String tableName, String name) {
+		return "alter table " + tableName + " alter foreign key " + name + " not enforced";
+	}
+
+	@Override
+	public String getEnableConstraintStatement(String tableName, String name) {
+		return "alter table " + tableName + " alter foreign key " + name + " enforced";
+	}
+
+	@Override
+	public String getTruncateTableStatement(String tableName) {
+		return super.getTruncateTableStatement(tableName) + " immediate";
+	}
+
+	@Override
+	public String getCreateUserDefinedTypeExtensionsString() {
+		return " instantiable mode db2sql";
+	}
+
+	/**
+	 * The more "standard" syntax is {@code rid_bit(alias)} but here we use {@code alias.rowid}.
+	 * <p>
+	 * There is also an alternative {@code rid()} of type {@code bigint}, but it cannot be used
+	 * with partitioning.
+	 */
+	@Override
+	public String rowId(String rowId) {
+		return "rowid";
+	}
+
+	@Override
+	public int rowIdSqlType() {
+		return VARBINARY;
+	}
+
+	@Override
+	public DmlTargetColumnQualifierSupport getDmlTargetColumnQualifierSupport() {
+		return DmlTargetColumnQualifierSupport.TABLE_ALIAS;
+	}
+
+	@Override
+	public boolean supportsFromClauseInUpdate() {
+		return true;
+	}
+
+	@Override
+	public String getDual() {
+		return "sysibm.sysdummy1";
+	}
+
+	@Override
+	public String getFromDualForSelectOnly() {
+		return " from " + getDual();
+	}
+
+	@Override
+	public boolean supportsRowValueConstructorSyntax() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsWithClauseInSubquery() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsRowValueConstructorSyntaxInQuantifiedPredicates() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsRowValueConstructorSyntaxInInList() {
+		return false;
+	}
+
+	@Override
+	public boolean supportsRowValueConstructorSyntaxInInSubQuery() {
+		return true;
+	}
+
+	@Override
+	public boolean supportsNotNullAfterGeneratedAs() {
+		return false;
+	}
+
+	@Override
+	public TemporalTableSupport getTemporalTableSupport() {
+		return new DB2TemporalTableSupport( this );
+	}
+}

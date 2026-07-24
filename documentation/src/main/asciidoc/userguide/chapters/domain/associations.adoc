@@ -1,0 +1,853 @@
+[[associations]]
+=== Associations
+:core-project-dir: {root-project-dir}/hibernate-core
+:example-dir-association: {core-project-dir}/src/test/java/org/hibernate/orm/test/associations
+:example-dir-any: {core-project-dir}/src/test/java/org/hibernate/orm/test/any
+:extrasdir: extras/associations
+
+Associations describe how two or more entities form a relationship based on a database joining semantics.
+
+[[associations-many-to-one]]
+==== `@ManyToOne`
+
+`@ManyToOne` is the most common association, having a direct equivalent in the relational database as well (e.g. foreign key),
+and so it establishes a relationship between a child entity and a parent.
+
+[[associations-many-to-one-example]]
+.`@ManyToOne` association
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToOneTest.java[tags=associations-many-to-one-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-one-example.sql[]
+----
+====
+
+Each entity has a lifecycle of its own. Once the `@ManyToOne` association is set, Hibernate will set the associated database foreign key column.
+
+[[associations-many-to-one-lifecycle-example]]
+.`@ManyToOne` association lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToOneTest.java[tags=associations-many-to-one-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-one-lifecycle-example.sql[]
+----
+====
+
+[[associations-one-to-many]]
+==== `@OneToMany`
+
+The `@OneToMany` association links a parent entity with one or more child entities.
+If the `@OneToMany` doesn't have a mirroring `@ManyToOne` association on the child side, the `@OneToMany` association is unidirectional.
+If there is a `@ManyToOne` association on the child side, the `@OneToMany` association is bidirectional and the application developer can navigate this relationship from both ends.
+
+[[associations-one-to-many-unidirectional]]
+===== Unidirectional `@OneToMany`
+
+When using a unidirectional `@OneToMany` association, Hibernate resorts to using a link table between the two joining entities.
+
+[[associations-one-to-many-unidirectional-example]]
+.Unidirectional `@OneToMany` association
+====
+[source,java]
+----
+include::{example-dir-association}/OneToManyUnidirectionalTest.java[tags=associations-one-to-many-unidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-many-unidirectional-example.sql[]
+----
+====
+
+[NOTE]
+====
+The `@OneToMany` association is by definition a parent association, regardless of whether it's a unidirectional or a bidirectional one.
+Only the parent side of an association makes sense to cascade its entity state transitions to children.
+====
+
+[[associations-one-to-many-unidirectional-lifecycle-example]]
+.Cascading `@OneToMany` association
+====
+[source,java]
+----
+include::{example-dir-association}/OneToManyUnidirectionalTest.java[tags=associations-one-to-many-unidirectional-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-many-unidirectional-lifecycle-example.sql[]
+----
+====
+
+When persisting the `Person` entity, the cascade will propagate the persist operation to the underlying `Phone` children as well.
+Upon removing a `Phone` from the phones collection, the association row is deleted from the link table, and the `orphanRemoval` attribute will trigger a `Phone` removal as well.
+
+[NOTE]
+====
+The unidirectional associations are not very efficient when it comes to removing child entities.
+In the example above, upon flushing the persistence context, Hibernate deletes all database rows from the link table (e.g. `Person_Phone`) that are associated with the parent `Person` entity and reinserts the ones that are still found in the `@OneToMany` collection.
+
+On the other hand, a bidirectional `@OneToMany` association is much more efficient because the child entity controls the association.
+====
+
+[[associations-one-to-many-bidirectional]]
+===== Bidirectional `@OneToMany`
+
+The bidirectional `@OneToMany` association also requires a `@ManyToOne` association on the child side.
+Although the Domain Model exposes two sides to navigate this association, behind the scenes, the relational database has only one foreign key for this relationship.
+
+Every bidirectional association must have one owning side only (the child side), the other one being referred to as the _inverse_ (or the `mappedBy`) side.
+
+[[associations-one-to-many-bidirectional-example]]
+.`@OneToMany` association mappedBy the `@ManyToOne` side
+====
+[source,java]
+----
+include::{example-dir-association}/OneToManyBidirectionalTest.java[tags=associations-one-to-many-bidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-many-bidirectional-example.sql[]
+----
+====
+
+[IMPORTANT]
+====
+Whenever a bidirectional association is formed, the application developer must make sure both sides are in-sync at all times.
+
+The `addPhone()` and `removePhone()` are utility methods that synchronize both ends whenever a child element is added or removed.
+====
+
+Because the `Phone` class has a `@NaturalId` column (the phone number being unique),
+the `equals()` and the `hashCode()` can make use of this property, and so the `removePhone()` logic is reduced to the `remove()` Java `Collection` method.
+
+[[associations-one-to-many-bidirectional-lifecycle-example]]
+.Bidirectional `@OneToMany` with an owner `@ManyToOne` side lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/OneToManyBidirectionalTest.java[tags=associations-one-to-many-bidirectional-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-many-bidirectional-lifecycle-example.sql[]
+----
+====
+
+Unlike the unidirectional `@OneToMany`, the bidirectional association is much more efficient when managing the collection persistence state.
+Every element removal only requires a single update (in which the foreign key column is set to `NULL`), and,
+if the child entity lifecycle is bound to its owning parent so that the child cannot exist without its parent,
+then we can annotate the association with the `orphanRemoval` attribute and dissociating the child will trigger a delete statement on the actual child table row as well.
+
+[[associations-one-to-one]]
+==== `@OneToOne`
+
+The `@OneToOne` association can either be unidirectional or bidirectional.
+A unidirectional association follows the relational database foreign key semantics, the client-side owning the relationship.
+A bidirectional association features a `mappedBy` `@OneToOne` parent side too.
+
+[[associations-one-to-one-unidirectional]]
+===== Unidirectional `@OneToOne`
+
+[[associations-one-to-one-unidirectional-example]]
+.Unidirectional `@OneToOne`
+====
+[source,java]
+----
+include::{example-dir-association}/OneToOneUnidirectionalTest.java[tags=associations-one-to-one-unidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-one-unidirectional-example.sql[]
+----
+====
+
+From a relational database point of view, the underlying schema is identical to the unidirectional `@ManyToOne` association,
+as the client-side controls the relationship based on the foreign key column.
+
+But then, it's unusual to consider the `Phone` as a client-side and the `PhoneDetails` as the parent-side because the details cannot exist without an actual phone.
+A much more natural mapping would be the `Phone` were the parent-side, therefore pushing the foreign key into the `PhoneDetails` table.
+This mapping requires a bidirectional `@OneToOne` association as you can see in the following example:
+
+[[associations-one-to-one-bidirectional]]
+===== Bidirectional `@OneToOne`
+
+[[associations-one-to-one-bidirectional-example]]
+.Bidirectional `@OneToOne`
+====
+[source,java]
+----
+include::{example-dir-association}/OneToOneBidirectionalTest.java[tags=associations-one-to-one-bidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-one-bidirectional-example.sql[]
+----
+====
+
+This time, the `PhoneDetails` owns the association, and, like any bidirectional association, the parent-side can propagate its lifecycle to the child-side through cascading.
+
+[[associations-one-to-one-bidirectional-lifecycle-example]]
+.Bidirectional `@OneToOne` lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/OneToOneBidirectionalTest.java[tags=associations-one-to-one-bidirectional-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-one-to-one-bidirectional-lifecycle-example.sql[]
+----
+====
+
+When using a bidirectional `@OneToOne` association, Hibernate enforces the unique constraint upon fetching the child-side.
+If there are more than one children associated with the same parent, Hibernate will throw a `org.hibernate.exception.ConstraintViolationException`.
+Continuing the previous example, when adding another `PhoneDetails`, Hibernate validates the uniqueness constraint when reloading the `Phone` object.
+
+[[associations-one-to-one-bidirectional-constraint-example]]
+.Bidirectional `@OneToOne` unique constraint
+====
+[source,java]
+----
+include::{example-dir-association}/OneToOneBidirectionalTest.java[tags=associations-one-to-one-bidirectional-constraint-example,indent=0]
+----
+====
+
+[[associations-one-to-one-bidirectional-lazy]]
+====== Bidirectional `@OneToOne` lazy association
+
+Although you might annotate the parent-side association to be fetched lazily,
+Hibernate cannot honor this request since it cannot know whether the association is `null` or not.
+
+The only way to figure out whether there is an associated record on the child side is to fetch the child association using a secondary query.
+Because this can lead to N+1 query issues, it's much more efficient to use unidirectional `@OneToOne` associations with the `@MapsId` annotation in place.
+
+However, if you really need to use a bidirectional association and want to make sure that this is always going to be fetched lazily,
+then you need to enable lazy state initialization bytecode enhancement.
+
+[[associations-one-to-one-bidirectional-lazy-example]]
+.Bidirectional `@OneToOne` lazy parent-side association
+====
+[source,java]
+----
+include::{example-dir-association}/OneToOneBidirectionalLazyTest.java[tags=associations-one-to-one-bidirectional-lazy-example,indent=0]
+----
+====
+
+For more about how to enable Bytecode enhancement,
+see the <<chapters/pc/BytecodeEnhancement.adoc#BytecodeEnhancement, Bytecode Enhancement chapter>>.
+
+[[associations-many-to-many]]
+==== `@ManyToMany`
+
+The `@ManyToMany` association requires a link table that joins two entities.
+Like the `@OneToMany` association, `@ManyToMany` can be either unidirectional or bidirectional.
+
+[[associations-many-to-many-unidirectional]]
+===== Unidirectional `@ManyToMany`
+
+[[associations-many-to-many-unidirectional-example]]
+.Unidirectional `@ManyToMany`
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyUnidirectionalTest.java[tags=associations-many-to-many-unidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-unidirectional-example.sql[]
+----
+====
+
+Just like with unidirectional `@OneToMany` associations, the link table is controlled by the owning side.
+
+When an entity is removed from the `@ManyToMany` collection, Hibernate simply deletes the joining record in the link table.
+Unfortunately, this operation requires removing all entries associated with a given parent and recreating the ones that are listed in the current running persistent context.
+
+[[associations-many-to-many-unidirectional-lifecycle-example]]
+.Unidirectional `@ManyToMany` lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyUnidirectionalTest.java[tags=associations-many-to-many-unidirectional-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-unidirectional-lifecycle-example.sql[]
+----
+====
+
+[NOTE]
+====
+For `@ManyToMany` associations, the `REMOVE` entity state transition doesn't make sense to be cascaded because it will propagate beyond the link table.
+Since the other side might be referenced by other entities on the parent-side, the automatic removal might end up in a `ConstraintViolationException`.
+
+For example, if `@ManyToMany(cascade = CascadeType.ALL)` was defined and the first person would be deleted,
+Hibernate would throw an exception because another person is still associated with the address that's being deleted.
+
+[source,java]
+----
+Person person1 = entityManager.find(Person.class, personId);
+entityManager.remove(person1);
+
+Caused by: jakarta.persistence.PersistenceException: org.hibernate.exception.ConstraintViolationException: could not execute statement
+Caused by: org.hibernate.exception.ConstraintViolationException: could not execute statement
+Caused by: java.sql.SQLIntegrityConstraintViolationException: integrity constraint violation: foreign key no action; FKM7J0BNABH2YR0PE99IL1D066U table: PERSON_ADDRESS
+----
+====
+
+By simply removing the parent-side, Hibernate can safely remove the associated link records as you can see in the following example:
+
+[[associations-many-to-many-unidirectional-remove-example]]
+.Unidirectional `@ManyToMany` entity removal
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyUnidirectionalTest.java[tags=associations-many-to-many-unidirectional-remove-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-unidirectional-remove-example.sql[]
+----
+====
+
+[[associations-many-to-many-bidirectional]]
+===== Bidirectional `@ManyToMany`
+
+A bidirectional `@ManyToMany` association has an owning and a `mappedBy` side.
+To preserve synchronicity between both sides, it's good practice to provide helper methods for adding or removing child entities.
+
+[[associations-many-to-many-bidirectional-example]]
+.Bidirectional `@ManyToMany`
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyBidirectionalTest.java[tags=associations-many-to-many-bidirectional-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-bidirectional-example.sql[]
+----
+====
+
+With the helper methods in place, the synchronicity management can be simplified, as you can see in the following example:
+
+[[associations-many-to-many-bidirectional-lifecycle-example]]
+.Bidirectional `@ManyToMany` lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyBidirectionalTest.java[tags=associations-many-to-many-bidirectional-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-bidirectional-lifecycle-example.sql[]
+----
+====
+
+If a bidirectional `@OneToMany` association performs better when removing or changing the order of child elements,
+the `@ManyToMany` relationship cannot benefit from such an optimization because the foreign key side is not in control.
+To overcome this limitation, the link table must be directly exposed and the `@ManyToMany` association split into two bidirectional `@OneToMany` relationships.
+
+[[associations-many-to-many-bidirectional-with-link-entity]]
+===== Bidirectional many-to-many with a link entity
+
+To most natural `@ManyToMany` association follows the same logic employed by the database schema,
+and the link table has an associated entity which controls the relationship for both sides that need to be joined.
+
+[[associations-many-to-many-bidirectional-with-link-entity-example]]
+.Bidirectional many-to-many with link entity
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyBidirectionalWithLinkEntityTest.java[tags=associations-many-to-many-bidirectional-with-link-entity-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-bidirectional-with-link-entity-example.sql[]
+----
+====
+
+Both the `Person` and the `Address` have a `mappedBy` `@OneToMany` side, while the `PersonAddress` owns the `person` and the `address` `@ManyToOne` associations.
+Because this mapping is formed out of two bidirectional associations, the helper methods are even more relevant.
+
+[NOTE]
+====
+The aforementioned example uses a Hibernate-specific mapping for the link entity since Jakarta Persistence doesn't allow building a composite identifier out of multiple `@ManyToOne` associations.
+
+For more details, see the <<chapters/domain/identifiers.adoc#identifiers-composite-associations,composite identifiers with associations>> section.
+====
+
+The entity state transitions are better managed than in the previous bidirectional `@ManyToMany` case.
+
+[[associations-many-to-many-bidirectional-with-link-entity-lifecycle-example]]
+.Bidirectional many-to-many with link entity lifecycle
+====
+[source,java]
+----
+include::{example-dir-association}/ManyToManyBidirectionalWithLinkEntityTest.java[tags=associations-many-to-many-bidirectional-with-link-entity-lifecycle-example,indent=0]
+----
+
+[source,sql]
+----
+include::{extrasdir}/associations-many-to-many-bidirectional-with-link-entity-lifecycle-example.sql[]
+----
+====
+
+There is only one delete statement executed because, this time, the association is controlled by the `@ManyToOne` side which only has to monitor the state of the underlying foreign key relationship to trigger the right DML statement.
+
+[[associations-not-found]]
+==== `@NotFound`
+
+When dealing with associations which are not enforced by a physical foreign-key, it is possible
+for a non-null foreign-key value to point to a non-existent value on the associated entity's table.
+
+[WARNING]
+====
+Not enforcing physical foreign-keys at the database level is highly discouraged.
+====
+
+Hibernate provides support for such models using the `@NotFound` annotation, which accepts a
+`NotFoundAction` value which indicates how Hibernate should behave when such broken foreign-keys
+are encountered -
+
+EXCEPTION:: (default) Hibernate will throw an exception (`FetchNotFoundException`)
+IGNORE:: the association will be treated as `null`
+
+Both `@NotFound(IGNORE)` and `@NotFound(EXCEPTION)` cause Hibernate to assume that there is
+no physical foreign-key.
+
+`@ManyToOne` and `@OneToOne` associations annotated with `@NotFound` are always fetched eagerly even
+if the `fetch` strategy is set to `FetchType.LAZY`.
+
+
+[TIP]
+====
+If the application itself manages the referential integrity and can guarantee that there are no
+broken foreign-keys, `jakarta.persistence.ForeignKey(NO_CONSTRAINT)` can be used instead.
+This will force Hibernate to not export physical foreign-keys, but still behave as if there is
+in terms of avoiding the downsides to `@NotFound`.
+====
+
+
+Considering the following `City` and `Person` entity mappings:
+
+[[associations-not-found-domain-model-example]]
+.`@NotFound` mapping example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-domain-model-example,indent=0]
+----
+====
+
+If we have the following entities in our database:
+
+[[associations-not-found-persist-example]]
+.`@NotFound` persist example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-persist-example,indent=0]
+----
+====
+
+When loading the `Person` entity, Hibernate is able to locate the associated `City` parent entity:
+
+[[associations-not-found-find-example]]
+.`@NotFound` - find existing entity example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-find-baseline,indent=0]
+----
+====
+
+However, if we break the foreign-key:
+
+[[associations-not-found-non-existing-persist-example]]
+.Break the foreign-key
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-break-fk,indent=0]
+----
+====
+
+Hibernate is not going to throw any exception, and it will assign a value of `null` for the non-existing `City` entity reference:
+
+[[associations-not-found-non-existing-find-example]]
+.`@NotFound` - find non-existing City example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-non-existing-find-example,indent=0]
+----
+====
+
+`@NotFound` also affects how the association is treated as "implicit joins" in HQL and Criteria.
+When there is a physical foreign-key, Hibernate can safely assume that the value in the foreign-key's
+key-column(s) will match the value in the target-column(s) because the database makes sure that
+is the case.  However, `@NotFound` forces Hibernate to perform a physical join for implicit joins
+when it might not be needed otherwise.
+
+Using the `Person` / `City` model, consider the query `from Person p where p.city.id is null`.
+
+Normally Hibernate would not need the join between the `Person` table and the `City` table because
+a physical foreign-key would ensure that any non-null value in the `Person.cityName` column
+has a matching non-null value in the `City.name` column.
+
+However, with `@NotFound` mappings it is possible to have a broken association because there is no
+physical foreign-key enforcing the relation.  As seen in <<associations-not-found-non-existing-persist-example>>,
+the `Person.cityName` column for John Doe has been changed from "New York" to "Atlantis" even though
+there is no `City` in the database named "Atlantis".  Hibernate is not able to trust the referring
+foreign-key value ("Atlantis") has a matching target value, so it must join to the `City` table to
+resolve the `city.id` value.
+
+
+[[associations-not-found-implicit-join-example]]
+.Implicit join example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-implicit-join-example,indent=0]
+----
+====
+
+Neither result includes a match for "John Doe" because the inner-join filters out that row.
+
+Hibernate does support a means to refer specifically to the key column (`Person.cityName`) in a query
+using the special `fk(..)` function.  E.g.
+
+[[associations-not-found-fk-function-example]]
+.FK example
+====
+[source,java]
+----
+include::{example-dir-association}/NotFoundTest.java[tags=associations-not-found-fk-function-example,indent=0]
+----
+====
+
+See <<hql-model-functions>>.
+
+
+[[associations-any]]
+==== `@Any` mapping
+
+The `@Any` mapping is useful to emulate a unidirectional `@ManyToOne` association when there can be multiple target entities.
+
+Because the `@Any` mapping defines a polymorphic association to classes from multiple tables,
+this association type requires the FK column which provides the associated parent identifier and
+a discriminator which identifies the associated entity type.
+
+[NOTE]
+====
+This is not the usual way of mapping polymorphic associations and you should use this only in special cases (e.g. audit logs, user session data, etc).
+====
+
+To map such an association, Hibernate needs to understand 3 things:
+
+1. The column and mapping for the <<associations-any-discriminator,discriminator>>
+2. The column and mapping for the <<associations-any-key,key>>
+3. The mapping between discriminator values and entity types which may be <<associations-any-explicit-discriminator,explicit>>
+<<associations-any-implicit-discriminator,implicit>> or <<associations-any-mixed-discriminator,mixed>>.
+
+For the rest of this discussion, consider the following model which will be the target types for the `@Any` associations:
+
+[[associations-any-target-example]]
+.`Payment` class hierarchy
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/Payment.java[tags=associations-any-example]
+
+include::{example-dir-any}/discriminator/CardPayment.java[tags=associations-any-example]
+
+include::{example-dir-any}/discriminator/CashPayment.java[tags=associations-any-example]
+
+include::{example-dir-any}/discriminator/CheckPayment.java[tags=associations-any-example]
+----
+====
+
+
+[[associations-any-discriminator]]
+===== The discriminator
+
+The discriminator is the value that indicates which entity is referred to by a row.
+
+Its "column" can be specified with either `@Column` or `@Formula`.  The mapping type can be influenced by any of:
+
+1. `@AnyDiscriminator` allows re-using the `DiscriminatorType` simplified mappings from Jakarta Persistence for the common cases
+2. `@JavaType`
+3. `@JdbcType`
+4. `@JdbcTypeCode`
+
+
+[[associations-any-key]]
+===== The key
+
+The key of an any-style association holds the matching key for the row
+
+Its "column" can be specified with either `@JoinColumn` (`@JoinFormula` not supported).  The mapping
+type can be influenced by any of:
+
+1. `@AnyKeyJavaClass`
+2. `@AnyKeyJavaType`
+3. `@AnyKeyJdbcType`
+4. `@AnyKeyJdbcTypeCode`
+
+
+
+[[associations-any-explicit-discriminator]]
+===== Explicit discriminator mappings
+
+Explicit discriminator mappings are defined using one-or-more `@AnyDiscriminatorValue` annotations.  E.g.
+
+
+[[associations-any-discriminator-explicit-example]]
+.Explicit @AnyDiscriminatorValue annotations
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/explicit/Order.java[tags=associations-any-explicit-discriminator-example]
+----
+====
+
+Here, we map 2 explicit discriminator value mappings:
+
+1. `CARD` <-> `CardPayment`
+2. `CHECK` <-> `CheckPayment`
+
+Notice that `CashPayment` is not explicitly mapped.  An attempt to use `CashPayment` for this attribute will result
+in an exception.
+
+
+[[associations-any-implicit-discriminator]]
+===== Implicit discriminator mappings
+
+Implicit discriminator mappings define no `@AnyDiscriminatorValue` annotations.  E.g.
+
+[[associations-any-discriminator-implicit-example]]
+.Implicit @Any discriminator mappings
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/implicit/Order.java[tags=associations-any-implicit-discriminator-example]
+----
+====
+
+Here all `Payment` subtypes are allowed.  By default Hibernate will use the entity's full-name (which is generally the class's FQN).
+
+Hibernate also offers a `@AnyDiscriminatorImplicitValues` annotation which allows configuration of how this implicit
+mapping works.  E.g., to use the entity's short-name instead of the full-name -
+
+
+[[associations-any-discriminator-implicit-short-example]]
+.Implicit @Any discriminator mappings (short name)
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/implicit/Order.java[tags=associations-any-implicit-discriminator-short-example]
+----
+====
+
+[NOTE]
+====
+`@AnyDiscriminatorImplicitValues` also offers the ability to define a custom strategy for determining the
+discriminator-value <-> entity-type mapping, but its use is not covered here.
+====
+
+
+[[associations-any-mixed-discriminator]]
+===== Mixed discriminator mappings
+
+A mixed strategy combines `@AnyDiscriminatorValue` and `@AnyDiscriminatorImplicitValues`.  Mappings
+explicitly defined using `@AnyDiscriminatorValue` take precedence.  E.g.
+
+
+[[associations-any-discriminator-mixed-example]]
+.Mixed @Any discriminator mappings (short name)
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/mixed/Order.java[tags=associations-any-mixed-discriminator-short-example]
+----
+====
+
+
+
+[[associations-any-meta-annotations]]
+===== Using meta-annotations
+
+As mentioned in <<basic-mapping>>, Hibernate's ANY-related annotations can be composed using meta-annotations
+to re-use ANY mapping details.
+
+Given all the details needed to define an ANY mapping, we can see how cumbersome it would be to duplicate that
+information every time `Payment` is mapped in the domain model.  This description can also be moved
+into a single annotation that we can apply in each usage.
+
+
+[[associations-any-composed-example]]
+.`@Any` mapping with meta-annotation
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/meta/Order.java[tags=associations-any-discriminator-meta-example]
+----
+====
+
+
+
+[[associations-many-to-any]]
+===== `@ManyToAny` mapping
+
+While the `@Any` mapping is useful to emulate a `@ManyToOne` association when there can be multiple target entities,
+to emulate a `@OneToMany` association, the `@ManyToAny` annotation must be used.
+
+The mapping details are the same between `@Any` and `@ManyToAny` except for:
+
+1. The use of `@ManyToAny` instead of `@Any`
+2. The use of `@JoinTable`, `@JoinTable#joinColumns` and `@JoinTable#inverseJoinColumns` instead
+    of just `@JoinColumn`
+
+
+In the following example, the `Loan` entity has a collection of `Payments` objects.
+
+The `loan_payments` table holds the associations between `Loan` and `Payment` references.
+
+[[associations-many-to-any-example]]
+.`@ManyToAny` mapping usage
+====
+[source, java, indent=0]
+----
+include::{example-dir-any}/discriminator/many/Loan.java[tags=associations-many-to-any-example]
+----
+
+[source, sql, indent=0]
+----
+include::{extrasdir}/associations-many-to-any-example.sql[]
+----
+====
+
+
+
+[[associations-JoinFormula]]
+==== `@JoinFormula` mapping
+
+The https://docs.hibernate.org/orm/{majorMinorVersion}/javadocs/org/hibernate/annotations/JoinFormula.html[`@JoinFormula`] annotation is used to customize the join between a child Foreign Key and a parent row Primary Key.
+
+[[associations-JoinFormula-example]]
+.`@JoinFormula` mapping usage
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinFormulaTest.java[tags=associations-JoinFormula-example]
+----
+
+[source, sql, indent=0]
+----
+include::{extrasdir}/associations-JoinFormula-example.sql[]
+----
+====
+
+The `country` association in the `User` entity is mapped by the country identifier provided by the `phoneNumber` property.
+
+Considering we have the following entities:
+
+[[associations-JoinFormula-persistence-example]]
+.`@JoinFormula` mapping usage
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinFormulaTest.java[tags=associations-JoinFormula-persistence-example]
+----
+====
+
+When fetching the `User` entities, the `country` property is mapped by the `@JoinFormula` expression:
+
+[[associations-JoinFormula-fetching-example]]
+.`@JoinFormula` mapping usage
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinFormulaTest.java[tags=associations-JoinFormula-fetching-example]
+----
+
+[source, sql, indent=0]
+----
+include::{extrasdir}/associations-JoinFormula-fetching-example.sql[]
+----
+====
+
+Therefore, the `@JoinFormula` annotation is used to define a custom join association between the parent-child association.
+
+[[associations-JoinColumnOrFormula]]
+==== `@JoinColumnOrFormula` mapping
+
+The https://docs.hibernate.org/orm/{majorMinorVersion}/javadocs/org/hibernate/annotations/JoinColumnOrFormula.html[`@JoinColumnOrFormula`] annotation is used to customize the join between a child Foreign Key and a parent row Primary Key when we need to take into consideration a column value as well as a `@JoinFormula`.
+
+[[associations-JoinColumnOrFormula-example]]
+.`@JoinColumnOrFormula` mapping usage
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinColumnOrFormulaTest.java[tags=associations-JoinColumnOrFormula-example]
+----
+
+[source, sql, indent=0]
+----
+include::{extrasdir}/associations-JoinColumnOrFormula-example.sql[]
+----
+====
+
+The `country` association in the `User` entity is mapped by the `language` property value and the associated `Country` `is_default` column value.
+
+Considering we have the following entities:
+
+[[associations-JoinColumnOrFormula-persistence-example]]
+.`@JoinColumnOrFormula` persist example
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinColumnOrFormulaTest.java[tags=associations-JoinColumnOrFormula-persistence-example]
+----
+====
+
+When fetching the `User` entities, the `country` property is mapped by the `@JoinColumnOrFormula` expression:
+
+[[associations-JoinColumnOrFormula-fetching-example]]
+.`@JoinColumnOrFormula` fetching example
+====
+[source, java, indent=0]
+----
+include::{example-dir-association}/JoinColumnOrFormulaTest.java[tags=associations-JoinColumnOrFormula-fetching-example]
+----
+
+[source, sql, indent=0]
+----
+include::{extrasdir}/associations-JoinColumnOrFormula-fetching-example.sql[]
+----
+====
+
+Therefore, the `@JoinColumnOrFormula` annotation is used to define a custom join association between the parent-child association.

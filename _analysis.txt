@@ -1,0 +1,66 @@
+files=4473 parse_errors=0
+tests=17451 failures=284 errors=0 skipped=2908 passed=14259
+pass rate=81.71%
+
+=== 失败最多的类 top 25 ===
+  54  org.hibernate.orm.test.hql.HQLTest
+  37  org.hibernate.orm.test.query.hql.FunctionTests
+  24  org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest
+   8  org.hibernate.orm.test.jpa.criteria.components.ComponentInWhereClauseTest
+   7  org.hibernate.orm.test.query.hql.ILikeTest
+   5  org.hibernate.orm.test.query.hql.ILikeCriteriaTest
+   4  org.hibernate.orm.test.notfound.MutationQueriesAndNotFoundActionTest
+   4  org.hibernate.orm.test.query.hql.LikeEscapeDefaultTest
+   3  org.hibernate.orm.test.jpa.criteria.components.EntitySuperclassComponentWithCollectionTest
+   3  org.hibernate.orm.test.jpa.criteria.components.MappedSuperclassComponentWithCollectionTest
+   3  org.hibernate.orm.test.jpa.criteria.ParameterTest
+   3  org.hibernate.orm.test.jpa.query.NativeQueryResultTypeAutoDiscoveryTest
+   3  org.hibernate.orm.test.mapping.mappedBy.IsNullAndMappedByTest
+   3  org.hibernate.orm.test.notfound.IsNullAndNotFoundTest
+   3  org.hibernate.temporal.TemporalEntityHistoryServerSideTest
+   2  org.hibernate.orm.test.schemaupdate.SchemaUpdateWithUseJdbcMetadataDefaultsSettingToFalseAndQuotedNameTest
+   2  org.hibernate.orm.test.annotations.quote.resultsetmappings.ExplicitSqlResultSetMappingTest
+   2  org.hibernate.orm.test.filter.FilterParameterTests
+   2  org.hibernate.orm.test.hql.ASTParserLoadingTest
+   2  org.hibernate.orm.test.hql.joinedSubclass.JoinedSubclassBulkManipTest
+   2  org.hibernate.orm.test.jpa.CriteriaUpdateAndDeleteWithJoinTest
+   2  org.hibernate.orm.test.length.LengthTest
+   2  org.hibernate.orm.test.mapping.generated.DefaultGeneratedValueTest
+   2  org.hibernate.orm.test.onetoone.formula.OneToOneFormulaTest
+   2  org.hibernate.orm.test.persister.entity.JoinedInheritanceImplicitJoinTest
+
+=== error 最多的类 top 15 ===
+
+=== failure message 聚类 top 30（按首行前200字符）===
+  48  [DefaultCatalogAndSchemaTest] java.lang.AssertionError: 
+  21  [HQLTest] org.opentest4j.AssertionFailedError: expected: <1> but was: <0>
+  13  [HQLTest] org.opentest4j.AssertionFailedError: expected: <3> but was: <0>
+  12  [HQLTest] org.opentest4j.AssertionFailedError: expected: <2> but was: <0>
+   8  [DurationValidationTest] org.hibernate.tool.schema.spi.SchemaManagementException: Schema validation: missing table [TestEntity]
+   4  [HQLTest] java.lang.IndexOutOfBoundsException: Index 0 out of bounds for length 0
+   3  [ParameterTest] org.hibernate.exception.DataException: JDBC exception executing SQL [[100.125.29.29:61674/121.37.186.131:19995] ERROR: invalid byte sequence for encoding "UTF8": 0xac] [select mtbae1_0.id,mtbae1_0.int
+   3  [IsNullAndMappedByTest] org.hibernate.exception.SQLGrammarException: JDBC exception executing SQL [[100.125.29.29:57262/121.37.186.131:19995] ERROR: syntax error at or near "("
+   3  [IsNullAndNotFoundTest] org.hibernate.exception.SQLGrammarException: JDBC exception executing SQL [[100.125.29.29:51792/121.37.186.131:19995] ERROR: syntax error at or near "from"
+   3  [ILikeCriteriaTest] org.opentest4j.AssertionFailedError: expected: <5> but was: <0>
+   3  [LiteralTests] org.hibernate.exception.DataException: JDBC exception executing SQL [[100.125.29.29:52973/121.37.186.131:19995] ERROR: The date, time, datetime, timestamp, or year is incorrect.] [select eob1_0.id,eob
+   2  [SchemaUpdateWithUseJdbcMetadataDefaultsSettingToFalseAndQuotedNameTest] org.hibernate.exception.SQLGrammarException: Unable to build DatabaseInformation [[100.125.29.29:53738/121.37.186.131:19995] ERROR: Relation "information_schema.sequences" does not exist on dn_6001.
+   2  [ExplicitSqlResultSetMappingTest] org.hibernate.exception.SQLGrammarException: could not extract ResultSet [[100.125.29.29:62671/121.37.186.131:19995] ERROR: relation "my_entity_table_seq" does not exist
+   2  [DefaultMutationStrategyGeneratedIdentityTest] org.hibernate.exception.ConstraintViolationException: JDBC exception executing SQL [[100.125.29.29:57745/121.37.186.131:19995] ERROR: insert or update on table "Engineer" violates foreign key constrai
+   2  [RefreshEntityWithLazyPropertyTest] org.opentest4j.AssertionFailedError: 
+   2  [HQLTest] jakarta.persistence.NoResultException: No result found for query [select p from Person p where p.name like :name]
+   2  [JoinedSubclassBulkManipTest] org.hibernate.exception.GenericJDBCException: JDBC exception executing SQL [[100.125.29.29:61674/121.37.186.131:19995] ERROR: current transaction is aborted, commands ignored until end of transaction 
+   2  [CteInsertWithPooledLoOptimizerTest] org.opentest4j.AssertionFailedError: expected: <11> but was: <10>
+   2  [SequenceMismatchStrategyDefaultExceptionTest] org.opentest4j.AssertionFailedError: Should throw MappingException!
+   2  [SequenceMismatchStrategyLogTest] org.opentest4j.AssertionFailedError: expected: <true> but was: <false>
+   2  [LengthTest] org.hibernate.exception.DataException: could not execute statement [[100.125.29.29:57263/121.37.186.131:19995] ERROR: Data too long for type text
+   2  [DefaultGeneratedValueTest] org.hibernate.exception.SQLGrammarException: could not execute statement [[100.125.29.29:51792/121.37.186.131:19995] ERROR: Relation "T_ENT_GEN_DEF" does not exist on dn_6001.
+   2  [MutationQueriesAndNotFoundActionTest] org.hibernate.exception.SQLGrammarException: JDBC exception executing SQL [[100.125.29.29:51792/121.37.186.131:19995] ERROR: syntax error at or near "("
+   2  [CountExpressionTest] org.hibernate.exception.SQLGrammarException: JDBC exception executing SQL [[100.125.29.29:51792/121.37.186.131:19995] ERROR: Unsupport type.
+   2  [FunctionTests] org.opentest4j.AssertionFailedError: expected: <10> but was: <null>
+   2  [FunctionTests] jakarta.persistence.NoResultException: No result found for query [select e.theDuration from EntityOfBasics e]
+   2  [ILikeCriteriaTest] org.opentest4j.AssertionFailedError: expected: <6> but was: <0>
+   2  [ILikeCriteriaTest] org.opentest4j.AssertionFailedError: expected: <7> but was: <0>
+   2  [ILikeCriteriaTest] org.opentest4j.AssertionFailedError: expected: <4> but was: <0>
+   2  [SchemaManagerDefaultSchemaTest] org.hibernate.tool.schema.spi.SchemaManagementException: Schema validation: missing table [AuthorForTesting]
+
+=== error message 聚类 top 15 ===

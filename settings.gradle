@@ -1,0 +1,195 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright Red Hat Inc. and Hibernate Authors
+ */
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven {
+            name = 'localPluginRepository'
+            url = uri( "${gradle.gradleUserHomeDir}/tmp/plugins" )
+        }
+    }
+
+    includeBuild 'local-build-plugins'
+}
+
+plugins {
+    id 'org.hibernate.orm.build.env-settings'
+    id 'org.hibernate.orm.build.jdks-settings'
+    id 'com.gradle.develocity' version '4.3.2'
+    id 'com.gradle.common-custom-user-data-gradle-plugin' version '2.4.0'
+}
+
+dependencyResolutionManagement {
+    repositories {
+        // See MAINTAINERS.md for documentation.
+        // TODO Move to infra overrides instead;
+        //  see https://blog.gradle.org/maven-central-mirror#overriding-the-urls-for-maven-central-and-the-plugin-portal-repositories
+        if ( System.getProperty( 'MAVEN_MIRROR' ) ?: System.env['MAVEN_MIRROR'] ) {
+            maven {
+                url System.getProperty( 'MAVEN_MIRROR' ) ?: System.env['MAVEN_MIRROR']
+                if ( System.getProperty( 'MAVEN_MIRROR_USERNAME' ) || System.env['MAVEN_MIRROR_USERNAME'] ) {
+                    credentials {
+                        username = System.getProperty( 'MAVEN_MIRROR_USERNAME' ) ?: System.env['MAVEN_MIRROR_USERNAME']
+                        if ( System.getProperty( 'MAVEN_MIRROR_PASSWORD' ) || System.env['MAVEN_MIRROR_PASSWORD'] ) {
+                            password = System.getProperty( 'MAVEN_MIRROR_PASSWORD' ) ?: System.env['MAVEN_MIRROR_PASSWORD']
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            mavenCentral()
+
+            if (System.getProperty('JPA_PREVIEW') != null) {
+                maven {
+                    url "https://jakarta.oss.sonatype.org/content/repositories/releases/"
+                }
+                // Needed for the SNAPSHOT versions of Jakarta Persistence
+                maven {
+                    url "https://central.sonatype.com/repository/maven-snapshots/"
+                }
+            }
+        }
+
+        //Allow loading additional dependencies from a local path;
+        //useful to load JDBC drivers which can not be distributed in public.
+        if (System.env['ADDITIONAL_REPO'] != null) {
+            flatDir {
+                dirs "${System.env.ADDITIONAL_REPO}"
+            }
+        }
+    }
+
+    pluginManagement {
+        repositories {
+            gradlePluginPortal()
+        }
+    }
+
+    dependencyResolutionManagement {
+        versionCatalogs {
+            jdks {
+                // see gradle.properties (or set with -D/-P)
+                var String baseJdk = jdkVersions.baseline
+                var String minJdk = jdkVersions.min
+                var String maxJdk = jdkVersions.max
+
+                version "baseline", baseJdk
+                version "compatible", "17 or 21"
+                version "jdbc", "4.2" // Bundled with JDK 11
+
+                // We may require a minimum JDK version, for consistency across builds
+                version "minSupportedJdk", minJdk
+                // Gradle does bytecode transformation on tests.
+                // You can't use bytecode higher than what Gradle supports, even with toolchains.
+                version "maxSupportedBytecode", maxJdk
+            }
+            libs {
+                def overrideableVersion = { String settingName, String versionName ->
+                    String overridden = settings.ext.find(settingName)
+                    if (overridden != null) {
+                        version(versionName, overridden)
+                    }
+                }
+
+                ///////////////////////////////////////////////////////////////////
+                // `jakartaJpaVersion` comes from the local-build-plugins
+                // to allow for command-line overriding of the JPA version to use
+                version("jpa", "${jakartaJpaVersion}")
+                overrideableVersion("gradle.libs.versions.jpa", "jpa")
+                ///////////////////////////////////////////////////////////////////
+                overrideableVersion("gradle.libs.versions.h2", "h2")
+                overrideableVersion("gradle.libs.versions.derby", "derby")
+                overrideableVersion("gradle.libs.versions.h2gis", "h2gis")
+                overrideableVersion("gradle.libs.versions.hsqldb", "hsqldb")
+            }
+        }
+    }
+}
+
+rootProject.name = 'hibernate-orm'
+
+apply from: file( 'gradle/gradle-develocity.gradle' )
+
+if ( !JavaVersion.current().java11Compatible ) {
+    throw new GradleException( "Gradle must be run with Java 11 or later" )
+}
+
+buildCache {
+    local {
+        // do not use local build cache for CI jobs, period!
+        enabled = !settings.ext.isCiEnvironment
+    }
+    remote(develocity.buildCache) {
+        enabled = settings.ext.useRemoteCache
+        // Check access key presence to avoid build cache errors on PR builds when access key is not present
+        def accessKey = System.getenv("DEVELOCITY_ACCESS_KEY")
+        push = settings.ext.populateRemoteBuildCache && accessKey
+    }
+}
+
+include 'hibernate-core'
+include 'hibernate-testing'
+
+include 'hibernate-envers'
+include 'hibernate-spatial'
+
+include 'hibernate-platform'
+
+include 'hibernate-community-dialects'
+include 'hibernate-vector'
+
+include 'hibernate-c3p0'
+include 'hibernate-hikaricp'
+include 'hibernate-agroal'
+
+include 'hibernate-jcache'
+
+include 'hibernate-micrometer'
+include 'hibernate-graalvm'
+include 'hibernate-integrationtest-java-modules'
+
+include 'local-build-asciidoctor-extensions'
+
+include 'documentation'
+include 'release'
+include 'reporting'
+
+// Not all JDK implementations support JFR
+if ( "OpenJDK Runtime Environment".equals( System.getProperty( "java.runtime.name" ) ) ) {
+    include 'hibernate-jfr'
+}
+
+include 'hibernate-scan-jandex'
+
+include 'metamodel-generator'
+project(':metamodel-generator').projectDir = new File(rootProject.projectDir, "tooling/metamodel-generator")
+project(':metamodel-generator').name = 'hibernate-processor'
+
+include 'hibernate-gradle-plugin'
+project(':hibernate-gradle-plugin').projectDir = new File(rootProject.projectDir, "tooling/hibernate-gradle-plugin")
+
+include 'hibernate-maven-plugin'
+project(':hibernate-maven-plugin').projectDir = new File(rootProject.projectDir, "tooling/hibernate-maven-plugin")
+
+include 'hibernate-ant'
+project(':hibernate-ant').projectDir = new File(rootProject.projectDir, "tooling/hibernate-ant")
+
+include 'hibernate-assistant'
+project(':hibernate-assistant').projectDir = new File(rootProject.projectDir, "tooling/hibernate-assistant")
+
+include 'hibernate-reveng'
+project(':hibernate-reveng').projectDir = new File(rootProject.projectDir, "tooling/hibernate-reveng")
+
+rootProject.children.each { project ->
+    project.buildFileName = "${project.name}.gradle"
+    assert project.projectDir.isDirectory()
+    assert project.buildFile.exists()
+    assert project.buildFile.isFile()
+}
+include 'hibernate-platform'
+
+

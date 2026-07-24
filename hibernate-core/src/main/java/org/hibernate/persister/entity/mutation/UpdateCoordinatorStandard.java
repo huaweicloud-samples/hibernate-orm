@@ -1,0 +1,1839 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright Red Hat Inc. and Hibernate Authors
+ */
+package org.hibernate.persister.entity.mutation;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.function.Supplier;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.hibernate.HibernateException;
+import org.hibernate.Internal;
+import org.hibernate.dialect.Dialect;
+import org.hibernate.engine.OptimisticLockStyle;
+import org.hibernate.engine.jdbc.batch.internal.BasicBatchKey;
+import org.hibernate.engine.jdbc.batch.spi.BatchKey;
+import org.hibernate.engine.jdbc.mutation.JdbcValueBindings;
+import org.hibernate.engine.jdbc.mutation.MutationExecutor;
+import org.hibernate.engine.jdbc.mutation.ParameterUsage;
+import org.hibernate.engine.jdbc.mutation.internal.MutationQueryOptions;
+import org.hibernate.engine.jdbc.mutation.internal.NoBatchKeyAccess;
+import org.hibernate.engine.jdbc.mutation.spi.BatchKeyAccess;
+import org.hibernate.engine.spi.EntityEntry;
+import org.hibernate.engine.spi.SessionFactoryImplementor;
+import org.hibernate.engine.spi.SharedSessionContractImplementor;
+import org.hibernate.generator.BeforeExecutionGenerator;
+import org.hibernate.generator.EventType;
+import org.hibernate.generator.Generator;
+import org.hibernate.generator.OnExecutionGenerator;
+import org.hibernate.generator.values.GeneratedValues;
+import org.hibernate.metamodel.mapping.AttributeMapping;
+import org.hibernate.metamodel.mapping.EntityVersionMapping;
+import org.hibernate.metamodel.mapping.SelectableMapping;
+import org.hibernate.metamodel.mapping.SingularAttributeMapping;
+import org.hibernate.persister.entity.EntityPersister;
+import org.hibernate.sql.model.MutationOperation;
+import org.hibernate.sql.model.MutationOperationGroup;
+import org.hibernate.sql.model.MutationType;
+import org.hibernate.sql.model.ast.MutatingTableReference;
+import org.hibernate.sql.model.ast.builder.AbstractTableUpdateBuilder;
+import org.hibernate.sql.model.ast.builder.MutationGroupBuilder;
+import org.hibernate.sql.model.ast.builder.TableMutationBuilder;
+import org.hibernate.sql.model.ast.builder.TableUpdateBuilder;
+import org.hibernate.sql.model.ast.builder.TableUpdateBuilderSkipped;
+import org.hibernate.sql.model.ast.builder.TableUpdateBuilderStandard;
+import org.hibernate.sql.model.internal.MutationOperationGroupFactory;
+import org.hibernate.sql.model.jdbc.JdbcMutationOperation;
+
+import static org.hibernate.engine.OptimisticLockStyle.DIRTY;
+import static org.hibernate.engine.internal.Versioning.isVersionIncrementRequired;
+import static org.hibernate.generator.EventType.UPDATE;
+import static org.hibernate.internal.CoreMessageLogger.CORE_LOGGER;
+import static org.hibernate.internal.util.collections.ArrayHelper.EMPTY_INT_ARRAY;
+import static org.hibernate.internal.util.collections.ArrayHelper.contains;
+import static org.hibernate.internal.util.collections.ArrayHelper.join;
+import static org.hibernate.internal.util.collections.ArrayHelper.trim;
+import static org.hibernate.internal.util.collections.CollectionHelper.arrayList;
+
+/**
+ * Coordinates the updating of an entity.
+ *
+ * @see #update
+ *
+ * @author Steve Ebersole
+ */
+public class UpdateCoordinatorStandard extends AbstractMutationCoordinator implements UpdateCoordinator {
+
+	private final MutationOperationGroup staticUpdateGroup;
+	private final BatchKey batchKey;
+
+	private final MutationOperationGroup versionUpdateGroup;
+	private final BatchKey versionUpdateBatchkey;
+	private final boolean hasCustomVersionUpdateSql;
+
+	public UpdateCoordinatorStandard(EntityPersister entityPersister, SessionFactoryImplementor factory) {
+		super( entityPersister, factory );
+
+		// NOTE: even given dynamic-update and/or dirty optimistic locking
+		// there are cases where we need the full static updates.
+		staticUpdateGroup = buildStaticUpdateGroup();
+		versionUpdateGroup = buildVersionUpdateGroup();
+		hasCustomVersionUpdateSql = hasCustomVersionUpdateSql( versionUpdateGroup );
+		if ( entityPersister.hasUpdateGeneratedProperties() ) {
+			// disable batching in case of update generated properties
+			batchKey = null;
+			versionUpdateBatchkey = null;
+		}
+		else {
+			batchKey = new BasicBatchKey( entityPersister.getEntityName() + "#UPDATE" );
+			versionUpdateBatchkey = new BasicBatchKey( entityPersister.getEntityName() + "#UPDATE_VERSION" );
+		}
+	}
+
+	//Used by Hibernate Reactive to efficiently create new instances of this same class
+	@SuppressWarnings("unused")
+	protected UpdateCoordinatorStandard(
+			EntityPersister entityPersister,
+			SessionFactoryImplementor factory,
+			MutationOperationGroup staticUpdateGroup,
+			BatchKey batchKey,
+			MutationOperationGroup versionUpdateGroup,
+			BatchKey versionUpdateBatchkey) {
+		super( entityPersister, factory );
+		this.staticUpdateGroup = staticUpdateGroup;
+		this.batchKey = batchKey;
+		this.versionUpdateGroup = versionUpdateGroup;
+		this.versionUpdateBatchkey = versionUpdateBatchkey;
+		this.hasCustomVersionUpdateSql = hasCustomVersionUpdateSql( versionUpdateGroup );
+	}
+
+	@Override
+	public MutationOperationGroup getStaticMutationOperationGroup() {
+		return staticUpdateGroup;
+	}
+
+	protected MutationOperationGroup getVersionUpdateGroup() {
+		return versionUpdateGroup;
+	}
+
+	protected BatchKey getBatchKey() {
+		return batchKey;
+	}
+
+	public final boolean isModifiableEntity(EntityEntry entry) {
+		return entry == null ? entityPersister().isMutable() : entry.isModifiableEntity();
+	}
+
+	@Override
+	public void forceVersionIncrement(
+			Object id,
+			Object currentVersion,
+			Object nextVersion,
+			SharedSessionContractImplementor session) {
+		if ( versionUpdateGroup == null ) {
+			throw new HibernateException( "Cannot force version increment relative to subtype; use the root type" );
+		}
+		doVersionUpdate( null, id, nextVersion, currentVersion, getLoadedState( id, session ), session );
+	}
+
+	private Object @Nullable [] getLoadedState(Object id, SharedSessionContractImplementor session) {
+		return entityPersister.hasPartitionedSelectionMapping()
+				? session.getPersistenceContextInternal()
+				.getEntityHolder( session.generateEntityKey( id, entityPersister ) ).getEntityEntry().getLoadedState()
+				: null;
+	}
+
+	@Override
+	public void forceVersionIncrement(
+			Object id,
+			Object currentVersion,
+			Object nextVersion,
+			boolean batching,
+			SharedSessionContractImplementor session) {
+		if ( versionUpdateGroup == null ) {
+			throw new HibernateException( "Cannot force version increment relative to subtype; use the root type" );
+		}
+		doVersionUpdate( null, id, nextVersion, currentVersion, batching, getLoadedState( id, session ), session );
+	}
+
+	@Override
+	public GeneratedValues update(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] values,
+			Object oldVersion,
+			Object[] incomingOldValues,
+			int[] incomingDirtyAttributeIndexes,
+			boolean hasDirtyCollection,
+			SharedSessionContractImplementor session) {
+		final var versionMapping = entityPersister().getVersionMapping();
+		if ( versionMapping != null ) {
+			final var generatedValuesAccess =
+					handlePotentialImplicitForcedVersionIncrement(
+							entity,
+							id,
+							values,
+							incomingOldValues,
+							oldVersion,
+							incomingDirtyAttributeIndexes,
+							session,
+							versionMapping
+					);
+			if ( generatedValuesAccess != null ) {
+				return generatedValuesAccess.get();
+			}
+		}
+
+		final var entry = session.getPersistenceContextInternal().getEntry( entity );
+
+		// Ensure that an immutable or non-modifiable entity is not being updated unless it is
+		// in the process of being deleted.
+		if ( entry == null && !entityPersister().isMutable() ) {
+			throw new IllegalStateException( "Updating immutable entity that is not in session yet" );
+		}
+
+		// apply any pre-update in-memory value generation
+		final int[] preUpdateGeneratedAttributeIndexes = preUpdateInMemoryValueGeneration( entity, values, session );
+		final int[] dirtyAttributeIndexes =
+				dirtyAttributeIndexes( incomingDirtyAttributeIndexes, preUpdateGeneratedAttributeIndexes );
+
+		final boolean temporalExcludedUpdate =
+				entityPersister().excludedFromTemporalVersioning( dirtyAttributeIndexes, hasDirtyCollection );
+
+		final boolean[] attributeUpdateability;
+		final boolean forceDynamicUpdate;
+		if ( temporalExcludedUpdate ) {
+			attributeUpdateability = getPropertiesToUpdate( dirtyAttributeIndexes, hasDirtyCollection );
+			for ( int i = 0; i < attributeUpdateability.length; i++ ) {
+				if ( attributeUpdateability[i] && !entityPersister().isPropertyTemporalExcluded( i ) ) {
+					attributeUpdateability[i] = false;
+				}
+			}
+			forceDynamicUpdate = true;
+		}
+		else if ( entityPersister().isDynamicUpdate() && dirtyAttributeIndexes != null ) {
+			attributeUpdateability = getPropertiesToUpdate( dirtyAttributeIndexes, hasDirtyCollection );
+			forceDynamicUpdate = true;
+		}
+		else if ( !isModifiableEntity( entry ) ) {
+			// either the entity is mapped as immutable or has been marked as read-only within the Session
+			attributeUpdateability = getPropertiesToUpdate(
+					dirtyAttributeIndexes == null ? EMPTY_INT_ARRAY : dirtyAttributeIndexes,
+					hasDirtyCollection
+			);
+			forceDynamicUpdate = true;
+		}
+		else if ( dirtyAttributeIndexes != null
+				&& entityPersister().hasUninitializedLazyProperties( entity )
+				&& hasLazyDirtyFields( entityPersister(), dirtyAttributeIndexes ) ) {
+			// we have an entity with dirty lazy attributes.  we need to use dynamic
+			// delete and add the dirty, lazy attributes plus the non-lazy attributes
+			forceDynamicUpdate = true;
+			attributeUpdateability = getPropertiesToUpdate( dirtyAttributeIndexes, hasDirtyCollection );
+
+			final var propertyLaziness = entityPersister().getPropertyLaziness();
+			for ( int i = 0; i < propertyLaziness.length; i++ ) {
+				// add also all the non-lazy properties because dynamic update is false
+				if ( !propertyLaziness[i] ) {
+					attributeUpdateability[i] = true;
+				}
+			}
+		}
+		else {
+			attributeUpdateability = getPropertyUpdateability( entity );
+			forceDynamicUpdate = entityPersister().hasUninitializedLazyProperties( entity );
+		}
+
+		return performUpdate(
+				entity,
+				id,
+				rowId,
+				values,
+				oldVersion,
+				incomingOldValues,
+				hasDirtyCollection,
+				session,
+				versionMapping,
+				dirtyAttributeIndexes,
+				attributeUpdateability,
+				forceDynamicUpdate,
+				temporalExcludedUpdate
+		);
+	}
+
+	protected GeneratedValues performUpdate(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] values,
+			Object oldVersion,
+			Object[] incomingOldValues,
+			boolean hasDirtyCollection,
+			SharedSessionContractImplementor session,
+			EntityVersionMapping versionMapping,
+			int[] dirtyAttributeIndexes,
+			boolean[] attributeUpdateability,
+			boolean forceDynamicUpdate,
+			boolean temporalExcludedUpdate) {
+
+		final InclusionChecker dirtinessChecker =
+				(position, attribute) -> isDirty(
+						hasDirtyCollection,
+						versionMapping,
+						dirtyAttributeIndexes,
+						attributeUpdateability,
+						position,
+						attribute,
+						entityPersister()
+				);
+
+		final InclusionChecker lockingChecker =
+				(position, attribute) -> includedInLock(
+						versionMapping,
+						dirtinessChecker,
+						position,
+						attribute,
+						entityPersister()
+				);
+
+		final var valuesAnalysis = analyzeUpdateValues(
+				entity,
+				values,
+				oldVersion,
+				incomingOldValues,
+				dirtyAttributeIndexes,
+				createInclusionChecker( attributeUpdateability ),
+				lockingChecker,
+				dirtinessChecker,
+				temporalExcludedUpdate,
+				rowId,
+				forceDynamicUpdate,
+				session
+		);
+
+		if ( valuesAnalysis.tablesNeedingUpdate.isEmpty()
+				&& valuesAnalysis.tablesNeedingDynamicUpdate.isEmpty() ) {
+			// nothing to do
+			return null;
+		}
+		else if ( valuesAnalysis.needsDynamicUpdate() ) {
+			return doDynamicUpdate(
+					entity,
+					id,
+					rowId,
+					values,
+					incomingOldValues,
+					dirtinessChecker,
+					valuesAnalysis,
+					session
+			);
+		}
+		else {
+			return doStaticUpdate(
+					entity,
+					id,
+					rowId,
+					values,
+					incomingOldValues,
+					valuesAnalysis,
+					session
+			);
+		}
+	}
+
+	protected static int[] dirtyAttributeIndexes(int[] incomingDirtyIndexes, int[] preUpdateGeneratedIndexes) {
+		if ( preUpdateGeneratedIndexes.length == 0 ) {
+			return incomingDirtyIndexes;
+		}
+		else {
+			return incomingDirtyIndexes == null
+					? preUpdateGeneratedIndexes
+					: join( incomingDirtyIndexes, preUpdateGeneratedIndexes );
+		}
+	}
+
+	private static boolean isDirty(
+			boolean hasDirtyCollection,
+			EntityVersionMapping versionMapping,
+			int[] dirtyAttributeIndexes,
+			boolean[] attributeUpdateability,
+			int position,
+			SingularAttributeMapping attribute,
+			EntityPersister persister) {
+		if ( !attributeUpdateability[position] ) {
+			return false;
+		}
+		else if ( versionMapping != null
+				&& versionMapping.getVersionAttribute() == attribute) {
+			return isVersionIncrementRequired(
+					dirtyAttributeIndexes,
+					hasDirtyCollection,
+					persister.getPropertyVersionability()
+			);
+		}
+		else if ( dirtyAttributeIndexes == null ) {
+			// we do not know, so assume it is
+			return true;
+		}
+		else {
+			return contains( dirtyAttributeIndexes, position );
+		}
+	}
+
+	private static boolean includedInLock(
+			EntityVersionMapping versionMapping,
+			InclusionChecker dirtinessChecker,
+			int position,
+			SingularAttributeMapping attribute,
+			EntityPersister persister) {
+		return switch ( persister.optimisticLockStyle() ) {
+			case NONE -> false;
+			case VERSION -> versionMapping != null
+					&& versionMapping.getVersionAttribute() == attribute;
+//						&& updateableAttributeIndexes[position];
+			case ALL -> attribute.getAttributeMetadata().isIncludedInOptimisticLocking();
+			case DIRTY -> attribute.getAttributeMetadata().isIncludedInOptimisticLocking()
+					&& dirtinessChecker.include( position, attribute );
+		};
+	}
+
+	protected Supplier<GeneratedValues> handlePotentialImplicitForcedVersionIncrement(
+			Object entity,
+			Object id,
+			Object[] values,
+			Object[] oldValues,
+			Object oldVersion,
+			int[] incomingDirtyAttributeIndexes,
+			SharedSessionContractImplementor session,
+			EntityVersionMapping versionMapping) {
+		// Handle a case where the only value being updated is the version.
+		// We treat this case specially in `#coordinateUpdate` to leverage
+		// `#doVersionUpdate`.
+		final Object newVersion;
+		if ( hasUpdateGeneratedValues() || hasCustomVersionUpdateSql ) {
+			// Can't use the version-only update: either there are fields
+			// generated by the UPDATE event that must be included in the
+			// statement, or a custom update SQL is defined which would
+			// be bypassed by the version-only update path
+			return null;
+		}
+		else if ( incomingDirtyAttributeIndexes != null ) {
+			switch ( incomingDirtyAttributeIndexes.length ) {
+				case 1:
+					final int dirtyAttributeIndex = incomingDirtyAttributeIndexes[0];
+					final var versionAttribute = versionMapping.getVersionAttribute();
+					final var dirtyAttribute = entityPersister().getAttributeMapping( dirtyAttributeIndex );
+					if ( versionAttribute == dirtyAttribute ) {
+						// only the version attribute itself is dirty
+						newVersion = values[dirtyAttributeIndex];
+					}
+					else {
+						// the dirty field is some other field
+						return null;
+					}
+					break;
+				case 0:
+					if ( oldVersion != null ) {
+						newVersion = values[versionMapping.getVersionAttribute().getStateArrayPosition()];
+						if ( versionMapping.areEqual( newVersion, oldVersion, session ) ) {
+							return null;
+						}
+					}
+					else {
+						return null;
+					}
+					break;
+				default:
+					return null;
+			}
+		}
+		else {
+			return null;
+		}
+
+		// we have just the version being updated - use the special handling
+		assert newVersion != null;
+		final var generatedValues = doVersionUpdate(
+				entity,
+				id,
+				newVersion,
+				oldVersion,
+				oldValues == null ? values : oldValues,
+				session
+		);
+		return () -> generatedValues;
+	}
+
+	private boolean hasUpdateGeneratedValues() {
+		final var entityMetamodel = entityPersister();
+		return entityMetamodel.hasUpdateGeneratedProperties()
+			|| entityMetamodel.hasPreUpdateGeneratedProperties();
+	}
+
+	private static boolean hasCustomVersionUpdateSql(MutationOperationGroup versionUpdateGroup) {
+		return versionUpdateGroup != null
+				&& versionUpdateGroup.getSingleOperation().getTableDetails().getUpdateDetails().getCustomSql() != null;
+	}
+
+	private static boolean isValueGenerationOnUpdateInSql(Generator generator, Dialect dialect) {
+		return generator != null
+			&& generator.generatedOnExecution()
+			&& generator.generatesOnUpdate()
+			&& ( (OnExecutionGenerator) generator ).referenceColumnsInSql( dialect, EventType.UPDATE );
+	}
+
+	/**
+	 * Which properties appear in the SQL update?
+	 * (Initialized, updateable ones!)
+	 */
+	public boolean[] getPropertyUpdateability(Object entity) {
+		return entityPersister().hasUninitializedLazyProperties( entity )
+				? entityPersister().getNonLazyPropertyUpdateability()
+				: entityPersister().getPropertyUpdateability();
+	}
+
+	protected GeneratedValues doVersionUpdate(
+			Object entity,
+			Object id,
+			Object version,
+			Object oldVersion,
+			Object[] loadedState,
+			SharedSessionContractImplementor session) {
+		return doVersionUpdate(
+				entity,
+				id,
+				version,
+				oldVersion,
+				true,
+				loadedState,
+				session
+		);
+	}
+
+	protected GeneratedValues doVersionUpdate(
+			Object entity,
+			Object id,
+			Object version,
+			Object oldVersion,
+			boolean batching,
+			Object[] loadedState,
+			SharedSessionContractImplementor session) {
+		assert versionUpdateGroup != null;
+
+		final var mutatingTableDetails =
+				(EntityTableMapping) versionUpdateGroup.getSingleOperation().getTableDetails();
+
+		final var mutationExecutor =
+				updateVersionExecutor( session, versionUpdateGroup, false, batching );
+
+		final var versionMapping = entityPersister().getVersionMapping();
+
+		// set the new version
+		mutationExecutor.getJdbcValueBindings().bindValue(
+				version,
+				mutatingTableDetails.getTableName(),
+				versionMapping.getSelectionExpression(),
+				ParameterUsage.SET
+		);
+
+		bindPartitionColumnValueBindings( loadedState, session, mutationExecutor.getJdbcValueBindings() );
+
+		// restrict the key
+		mutatingTableDetails.getKeyMapping().breakDownKeyJdbcValues(
+				id,
+				(jdbcValue, columnMapping) ->
+						mutationExecutor.getJdbcValueBindings().bindValue(
+								jdbcValue,
+								mutatingTableDetails.getTableName(),
+								columnMapping.getColumnName(),
+								ParameterUsage.RESTRICT
+						),
+				session
+		);
+
+		// restrict the old-version
+		mutationExecutor.getJdbcValueBindings().bindValue(
+				oldVersion,
+				mutatingTableDetails.getTableName(),
+				versionMapping.getSelectionExpression(),
+				ParameterUsage.RESTRICT
+		);
+
+		try {
+			return mutationExecutor.execute(
+					entity,
+					null,
+					tableMapping -> tableMapping.getTableName().equals( entityPersister.getIdentifierTableName() ),
+					(statementDetails, affectedRowCount, batchPosition) ->
+							resultCheck( id, statementDetails, affectedRowCount, batchPosition ),
+					session,
+					staleStateException -> staleObjectStateException( id, staleStateException )
+			);
+		}
+		finally {
+			mutationExecutor.release();
+		}
+	}
+
+	private int[] preUpdateInMemoryValueGeneration(
+			Object object,
+			Object[] newValues,
+			SharedSessionContractImplementor session) {
+		final var persister = entityPersister();
+		if ( !persister.hasPreUpdateGeneratedProperties() ) {
+			return EMPTY_INT_ARRAY;
+		}
+
+		final var generators = persister.getGenerators();
+		if ( generators.length != 0 ) {
+			final int[] fieldsPreUpdateNeeded = new int[generators.length];
+			int count = 0;
+			for ( int i = 0; i < generators.length; i++ ) {
+				final var generator = generators[i];
+				if ( generator != null
+						&& generator.generatesOnUpdate()
+						&& generator.generatedBeforeExecution( object, session ) ) {
+					newValues[i] = ( (BeforeExecutionGenerator) generator ).generate( session, object, newValues[i], UPDATE );
+					entityPersister().setValue( object, i, newValues[i] );
+					fieldsPreUpdateNeeded[count++] = i;
+				}
+			}
+
+			if ( count > 0 ) {
+				return trim( fieldsPreUpdateNeeded, count );
+			}
+		}
+
+		return EMPTY_INT_ARRAY;
+	}
+
+	public boolean[] getPropertyUpdateability() {
+		return entityPersister().getPropertyUpdateability();
+	}
+
+	/**
+	 * Transform the array of property indexes to an array of booleans for each attribute,
+	 * true when the property is dirty
+	 */
+	protected boolean[] getPropertiesToUpdate(final int[] dirtyProperties, final boolean hasDirtyCollection) {
+		final var persister = entityPersister();
+		if ( dirtyProperties == null ) {
+			return getPropertyUpdateability();
+		}
+		else {
+			final var updateability = persister.getPropertyUpdateability();
+			final var insertability = persister.getPropertyInsertability();
+			final var propsToUpdate = new boolean[persister.getNumberOfAttributeMappings()];
+			for ( int property: dirtyProperties ) {
+				propsToUpdate[property] = includeProperty( insertability, updateability, property );
+			}
+			if ( persister.isVersioned() ) {
+				final var versionAttribute = persister.getVersionMapping().getVersionAttribute();
+				if ( versionAttribute.isUpdateable() ) {
+					final int versionAttributeIndex = versionAttribute.getStateArrayPosition();
+					propsToUpdate[versionAttributeIndex] =
+							propsToUpdate[versionAttributeIndex]
+							|| isVersionIncrementRequired(
+									dirtyProperties,
+									hasDirtyCollection,
+									persister.getPropertyVersionability()
+							);
+				}
+			}
+			return propsToUpdate;
+		}
+	}
+
+	protected boolean includeProperty(boolean[] insertability, boolean[] updateability, int property) {
+		return updateability[property];
+	}
+
+	protected UpdateValuesAnalysisImpl analyzeUpdateValues(
+			Object entity,
+			Object[] values,
+			Object oldVersion,
+			Object[] oldValues,
+			int[] dirtyAttributeIndexes,
+			InclusionChecker inclusionChecker,
+			InclusionChecker lockingChecker,
+			InclusionChecker dirtinessChecker,
+			boolean restrictToTemporalExcluded,
+			Object rowId,
+			boolean forceDynamicUpdate,
+			SharedSessionContractImplementor session) {
+		final var persister = entityPersister();
+		final var attributeMappings = persister.getAttributeMappings();
+
+		// NOTE:
+		// 		* `dirtyAttributeIndexes == null` means we had no snapshot and couldn't
+		// 			get one using select-before-update; never the case for #merge
+		//		* `oldValues == null` just means we had no snapshot to begin with - we might
+		//			have used select-before-update to get the dirtyAttributeIndexes (again,
+		//			never the case for #merge)
+		final var analysis = new UpdateValuesAnalysisImpl(
+				values,
+				oldValues,
+				dirtyAttributeIndexes,
+				dirtinessChecker,
+				rowId,
+				forceDynamicUpdate
+		);
+
+		for ( int attributeIndex = 0; attributeIndex < attributeMappings.size(); attributeIndex++ ) {
+			final var attributeMapping = attributeMappings.get( attributeIndex );
+			analysis.startingAttribute( attributeMapping );
+
+			try {
+				if ( attributeMapping.getJdbcTypeCount() > 0
+						&& attributeMapping instanceof SingularAttributeMapping singularAttributeMapping ) {
+					processAttribute(
+							entity,
+							analysis,
+							attributeIndex,
+							singularAttributeMapping,
+							oldVersion,
+							oldValues,
+							inclusionChecker,
+							lockingChecker,
+							restrictToTemporalExcluded,
+							session
+					);
+
+					// In this case we check for exactly DirtynessStatus.DIRTY so to not log warnings when the user didn't get it wrong:
+					if ( analysis.currentAttributeAnalysis.getDirtynessStatus() == AttributeAnalysis.DirtynessStatus.DIRTY ) {
+						if ( !includeProperty( persister.getPropertyInsertability(), persister.getPropertyUpdateability(), attributeIndex ) ) {
+							CORE_LOGGER.ignoreImmutablePropertyModification( attributeMapping.getAttributeName(), persister.getEntityName() );
+						}
+					}
+				}
+			}
+			finally {
+				analysis.finishedAttribute( attributeMapping );
+			}
+		}
+
+		return analysis;
+	}
+
+	private void processAttribute(
+			Object entity,
+			UpdateValuesAnalysisImpl analysis,
+			int attributeIndex,
+			SingularAttributeMapping attributeMapping,
+			Object oldVersion,
+			Object[] oldValues,
+			InclusionChecker inclusionChecker,
+			InclusionChecker lockingChecker,
+			boolean restrictToTemporalExcluded,
+			SharedSessionContractImplementor session) {
+
+		final var generator =
+				restrictToTemporalExcluded
+						&& !entityPersister().isPropertyTemporalExcluded( attributeIndex )
+				? null
+				: attributeMapping.getGenerator();
+		final boolean generatesOnUpdate =
+				generator != null
+						&& generator.generatesOnUpdate();
+		final boolean needsDynamicUpdate =
+				generatesOnUpdate
+						&& session != null
+						&& generator.generatedBeforeExecution( entity, session )
+						// Only force dynamic update when the generator can switch to on-execution mode.
+						&& generator.generatedOnExecution();
+		final boolean generatedOnExecution =
+				generatesOnUpdate
+						&& ( session == null
+							? generator.generatedOnExecution()
+							: generator.generatedOnExecution( entity, session )
+						);
+		final boolean generatedInSql =
+				generatedOnExecution
+						&& generator instanceof OnExecutionGenerator onExecutionGenerator
+						&& hasValueGenerationOnExecution( onExecutionGenerator, dialect, EventType.UPDATE );
+		if ( generatedInSql
+				&& !needsDynamicUpdate
+				&& !( (OnExecutionGenerator) generator ).writePropertyValue( EventType.UPDATE ) ) {
+			analysis.registerValueGeneratedInSqlNoWrite();
+		}
+
+		if ( needsDynamicUpdate || generatedInSql || inclusionChecker.include( attributeIndex, attributeMapping ) ) {
+			final int jdbcTypeCount = attributeMapping.getJdbcTypeCount();
+			for ( int i = 0; i < jdbcTypeCount; i++ ) {
+				processSet( analysis, attributeMapping.getSelectable( i ), needsDynamicUpdate );
+			}
+		}
+
+		if ( lockingChecker.include( attributeIndex, attributeMapping ) ) {
+			processLock( analysis, attributeMapping, session,
+					attributeLockValue( attributeIndex, attributeMapping, oldVersion, oldValues ) );
+		}
+	}
+
+	private Object attributeLockValue(
+			int attributeIndex,
+			SingularAttributeMapping attributeMapping,
+			Object oldVersion,
+			Object[] oldValues) {
+		final var versionMapping = entityPersister().getVersionMapping();
+		if ( versionMapping != null
+			&& versionMapping.getVersionAttribute() == attributeMapping ) {
+			return oldVersion;
+		}
+		else {
+			return oldValues == null ? null : oldValues[attributeIndex];
+		}
+	}
+
+	private void processSet(UpdateValuesAnalysisImpl analysis, SelectableMapping selectable, boolean needsDynamicUpdate) {
+		if ( selectable != null && !selectable.isFormula() && isColumnIncludedInSet( selectable ) ) {
+			final var tableMapping = physicalTableMappingForMutation( entityPersister(), selectable );
+			analysis.registerColumnSet( tableMapping, selectable.getSelectionExpression(), selectable.getWriteExpression() );
+			if ( needsDynamicUpdate ) {
+				analysis.getTablesNeedingDynamicUpdate().add( tableMapping );
+			}
+		}
+	}
+
+	protected boolean isColumnIncludedInSet(SelectableMapping selectable) {
+		return selectable.isUpdateable();
+	}
+
+	protected InclusionChecker createInclusionChecker(boolean[] attributeUpdateability) {
+		return (position, attribute) -> attributeUpdateability[position];
+	}
+
+	private void processLock(
+			UpdateValuesAnalysisImpl analysis,
+			SingularAttributeMapping attributeMapping,
+			SharedSessionContractImplementor session,
+			Object attributeLockValue) {
+		attributeMapping.decompose(
+				attributeLockValue,
+				0,
+				analysis,
+				null,
+				(valueIndex, updateAnalysis, noop, jdbcValue, columnMapping) -> {
+					if ( !columnMapping.isFormula() ) {
+						updateAnalysis.registerColumnOptLock(
+								physicalTableMappingForMutation( entityPersister(), columnMapping ),
+								columnMapping.getSelectionExpression(),
+								jdbcValue
+						);
+					}
+				},
+				session
+		);
+	}
+
+	protected GeneratedValues doStaticUpdate(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] values,
+			Object[] oldValues,
+			UpdateValuesAnalysisImpl valuesAnalysis,
+			SharedSessionContractImplementor session) {
+
+		final var mutationExecutor = executor( session, staticUpdateGroup, false );
+
+		decomposeForUpdate(
+				entity,
+				id,
+				rowId,
+				values,
+				valuesAnalysis,
+				mutationExecutor,
+				staticUpdateGroup,
+//				(position, attribute) -> valuesAnalysis.getAttributeAnalyses().get( position ).isDirty(),
+				(position, attribute) -> AttributeAnalysis.DirtynessStatus.CONSIDER_LIKE_DIRTY,
+				session
+		);
+		// no snapshot when called from StatelessSession.update()
+		bindPartitionColumnValueBindings( oldValues == null ? values : oldValues,
+				session, mutationExecutor.getJdbcValueBindings() );
+
+		try {
+			return mutationExecutor.execute(
+					entity,
+					valuesAnalysis,
+					valuesAnalysis.tablesNeedingUpdate::contains,
+					(statementDetails, affectedRowCount, batchPosition) ->
+							resultCheck( id, statementDetails, affectedRowCount, batchPosition ),
+					session,
+					staleStateException -> staleObjectStateException( id, staleStateException )
+			);
+		}
+		finally {
+			mutationExecutor.release();
+		}
+	}
+
+	protected void decomposeForUpdate(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] values,
+			UpdateValuesAnalysisImpl valuesAnalysis,
+			MutationExecutor mutationExecutor,
+			MutationOperationGroup jdbcOperationGroup,
+			DirtinessChecker dirtinessChecker,
+			SharedSessionContractImplementor session) {
+		final var jdbcValueBindings = mutationExecutor.getJdbcValueBindings();
+
+		// apply values
+		for ( int position = 0; position < jdbcOperationGroup.getNumberOfOperations(); position++ ) {
+			final var operation = jdbcOperationGroup.getOperation( position );
+			final var tableMapping = (EntityTableMapping) operation.getTableDetails();
+			if ( valuesAnalysis.tablesNeedingUpdate.contains( tableMapping ) ) {
+				for ( int attributeIndex : tableMapping.getAttributeIndexes() ) {
+					decomposeAttributeForUpdate(
+							entity,
+							values,
+							valuesAnalysis,
+							dirtinessChecker,
+							session,
+							jdbcValueBindings,
+							tableMapping,
+							attributeIndex
+					);
+				}
+			}
+		}
+
+		// apply keys
+		for ( int position = 0; position < jdbcOperationGroup.getNumberOfOperations(); position++ ) {
+			final var operation = jdbcOperationGroup.getOperation( position );
+			final var tableMapping = (EntityTableMapping) operation.getTableDetails();
+			breakDownKeyJdbcValues( id, rowId, session, jdbcValueBindings, tableMapping );
+		}
+	}
+
+	private void decomposeAttributeForUpdate(
+			Object entity,
+			Object[] values,
+			UpdateValuesAnalysisImpl valuesAnalysis,
+			DirtinessChecker dirtinessChecker,
+			SharedSessionContractImplementor session,
+			JdbcValueBindings jdbcValueBindings,
+			EntityTableMapping tableMapping,
+			int attributeIndex) {
+		final var attributeMapping = entityPersister().getAttributeMappings().get( attributeIndex );
+		if ( attributeMapping instanceof SingularAttributeMapping ) {
+			final var attributeAnalysisRef = valuesAnalysis.attributeAnalyses.get( attributeIndex );
+			if ( !attributeAnalysisRef.isSkipped() ) {
+				final var attributeAnalysis = (IncludedAttributeAnalysis) attributeAnalysisRef;
+
+				if ( attributeAnalysis.includeInSet() ) {
+					// apply the new values
+					if ( includeInSet( dirtinessChecker, attributeIndex, attributeMapping, attributeAnalysis ) ) {
+						decomposeAttributeMapping(
+								session,
+								jdbcValueBindings,
+								tableMapping,
+								attributeMapping,
+								values[attributeIndex],
+								entity
+						);
+					}
+				}
+
+				// apply any optimistic locking
+				if ( attributeAnalysis.includeInLocking() ) {
+					optimisticLock( session, jdbcValueBindings, tableMapping, attributeAnalysis );
+				}
+			}
+		}
+	}
+
+	private static void optimisticLock(
+			SharedSessionContractImplementor session,
+			JdbcValueBindings jdbcValueBindings,
+			EntityTableMapping tableMapping,
+			IncludedAttributeAnalysis attributeAnalysis) {
+		attributeAnalysis.columnLockingAnalyses.forEach( columnLockingAnalysis -> {
+			if ( columnLockingAnalysis.getLockValue() != null ) {
+				jdbcValueBindings.bindValue(
+						columnLockingAnalysis.getLockValue(),
+						tableMapping.getTableName(),
+						columnLockingAnalysis.getReadExpression(),
+						ParameterUsage.RESTRICT
+				);
+			}
+		} );
+	}
+
+	private void decomposeAttributeMapping(
+			SharedSessionContractImplementor session,
+			JdbcValueBindings jdbcValueBindings,
+			EntityTableMapping tableMapping,
+			AttributeMapping attributeMapping,
+			Object values,
+			Object entity) {
+		final var generator = attributeMapping.getGenerator();
+		final OnExecutionGenerator onExecutionGenerator;
+		final String[] columnValues;
+		final boolean[] columnInclusions;
+		final boolean bindAllValues;
+		if ( generator instanceof OnExecutionGenerator executionGenerator
+				&& generator.generatedOnExecution( entity, session )
+				&& generator.generatesOnUpdate() ) {
+			onExecutionGenerator = executionGenerator;
+			columnValues = onExecutionGenerator.getReferencedColumnValues( dialect(), EventType.UPDATE );
+			columnInclusions = onExecutionGenerator.getColumnInclusions( dialect(), EventType.UPDATE );
+			bindAllValues = onExecutionGenerator.writePropertyValue( EventType.UPDATE ) && columnValues == null;
+		}
+		else {
+			onExecutionGenerator = null;
+			columnValues = null;
+			columnInclusions = null;
+			bindAllValues = false;
+		}
+
+		attributeMapping.decompose(
+				values,
+				0,
+				jdbcValueBindings,
+				tableMapping,
+				(valueIndex, bindings, table, jdbcValue, jdbcMapping) -> {
+					if ( !jdbcMapping.isFormula()
+							&& isColumnIncludedInSet( jdbcMapping )
+							&& shouldBindValue( onExecutionGenerator, columnValues, columnInclusions, bindAllValues, valueIndex ) ) {
+						bindings.bindValue(
+								jdbcValue,
+								table.getTableName(),
+								jdbcMapping.getSelectionExpression(),
+								ParameterUsage.SET
+						);
+					}
+				},
+				session
+		);
+	}
+
+	private static boolean shouldBindValue(
+			OnExecutionGenerator onExecutionGenerator,
+			String[] columnValues,
+			boolean[] columnInclusions,
+			boolean bindAllValues,
+			int valueIndex) {
+		if ( onExecutionGenerator == null ) {
+			return true;
+		}
+		else if ( columnInclusions != null && !columnInclusions[valueIndex] ) {
+			return false;
+		}
+		else {
+			return bindAllValues
+				|| columnValues != null && "?".equals( columnValues[valueIndex] );
+		}
+	}
+
+	private boolean includeInSet(
+			DirtinessChecker dirtinessChecker,
+			int attributeIndex,
+			AttributeMapping attributeMapping,
+			IncludedAttributeAnalysis attributeAnalysis) {
+		if ( attributeAnalysis.isValueGeneratedInSqlNoWrite() ) {
+			// we applied `#getDatabaseGeneratedReferencedColumnValue` earlier
+			return false;
+		}
+		else if ( entityPersister().isVersioned()
+				&& entityPersister().getVersionMapping().getVersionAttribute() == attributeMapping) {
+			return true;
+		}
+		else if ( entityPersister().isDynamicUpdate() && dirtinessChecker != null ) {
+			return attributeAnalysis.includeInSet()
+				&& dirtinessChecker.isDirty( attributeIndex, attributeMapping ).isDirty();
+		}
+		else {
+			return true;
+		}
+	}
+
+	protected GeneratedValues doDynamicUpdate(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] values,
+			Object[] oldValues,
+			InclusionChecker dirtinessChecker,
+			UpdateValuesAnalysisImpl valuesAnalysis,
+			SharedSessionContractImplementor session) {
+		// Create the JDBC operation descriptors
+		final var dynamicUpdateGroup = generateDynamicUpdateGroup(
+				entity,
+				id,
+				rowId,
+				oldValues,
+				valuesAnalysis,
+				session
+		);
+
+		// and then execute them
+
+		final var mutationExecutor = executor( session, dynamicUpdateGroup, true );
+
+		decomposeForUpdate(
+				entity,
+				id,
+				rowId,
+				values,
+				valuesAnalysis,
+				mutationExecutor,
+				dynamicUpdateGroup,
+				(attributeIndex, attribute) ->
+						dirtinessChecker.include( attributeIndex, (SingularAttributeMapping) attribute )
+								? AttributeAnalysis.DirtynessStatus.CONSIDER_LIKE_DIRTY
+								: AttributeAnalysis.DirtynessStatus.NOT_DIRTY,
+				session
+		);
+		// no snapshot when called from StatelessSession.update()
+		bindPartitionColumnValueBindings( oldValues == null ? values : oldValues,
+				session, mutationExecutor.getJdbcValueBindings() );
+
+		try {
+			return mutationExecutor.execute(
+					entity,
+					valuesAnalysis,
+					tableMapping ->
+							tableMapping.isOptional() && !valuesAnalysis.tablesWithNonNullValues.contains( tableMapping )
+									// the table is optional, and we have null values for all of its columns
+									? valuesAnalysis.dirtyAttributeIndexes.length > 0
+									: valuesAnalysis.tablesNeedingUpdate.contains( tableMapping ),
+					(statementDetails, affectedRowCount, batchPosition) ->
+							resultCheck( id, statementDetails, affectedRowCount, batchPosition ),
+					session,
+					staleStateException -> staleObjectStateException( id, staleStateException )
+			);
+		}
+		finally {
+			mutationExecutor.release();
+		}
+	}
+
+	private MutationExecutor executor(
+			SharedSessionContractImplementor session, MutationOperationGroup group, boolean dynamicUpdate) {
+		return mutationExecutorService
+				.createExecutor( resolveBatchKeyAccess( dynamicUpdate, session ), group, session );
+	}
+
+	private MutationExecutor updateVersionExecutor(
+			SharedSessionContractImplementor session, MutationOperationGroup group, boolean dynamicUpdate) {
+		return mutationExecutorService
+				.createExecutor( resolveUpdateVersionBatchKeyAccess( dynamicUpdate, session ), group, session );
+	}
+
+	private MutationExecutor updateVersionExecutor(
+			SharedSessionContractImplementor session,
+			MutationOperationGroup group,
+			boolean dynamicUpdate,
+			boolean batching) {
+		return batching
+				? updateVersionExecutor( session, group, dynamicUpdate )
+				: mutationExecutorService.createExecutor( NoBatchKeyAccess.INSTANCE, group, session );
+
+	}
+
+	protected BatchKeyAccess resolveUpdateVersionBatchKeyAccess(boolean dynamicUpdate, SharedSessionContractImplementor session) {
+		if ( !dynamicUpdate
+				&& session.getTransactionCoordinator() != null
+				&& session.getTransactionCoordinator().isTransactionActive() ) {
+			return this::getVersionUpdateBatchkey;
+		}
+		else {
+			return NoBatchKeyAccess.INSTANCE;
+		}
+	}
+
+	//Used by Hibernate Reactive
+	protected BatchKey getVersionUpdateBatchkey(){
+		return versionUpdateBatchkey;
+	}
+
+	protected MutationOperationGroup generateDynamicUpdateGroup(
+			Object entity,
+			Object id,
+			Object rowId,
+			Object[] oldValues,
+			UpdateValuesAnalysisImpl valuesAnalysis,
+			SharedSessionContractImplementor session) {
+		final var updateGroupBuilder = new MutationGroupBuilder( MutationType.UPDATE, entityPersister() );
+
+		entityPersister().forEachMutableTable( (tableMapping) -> {
+			final var tableReference = new MutatingTableReference( tableMapping );
+			final var tableUpdateBuilder =
+					valuesAnalysis.tablesNeedingUpdate.contains( tableReference.getTableMapping() )
+							? createTableUpdateBuilder( tableMapping )
+							// this table does not need updating
+							: new TableUpdateBuilderSkipped( tableReference );
+			updateGroupBuilder.addTableDetailsBuilder( tableUpdateBuilder );
+		} );
+
+		applyTableUpdateDetails(
+				entity,
+				rowId,
+				updateGroupBuilder,
+				oldValues,
+				valuesAnalysis,
+				(position, attribute) -> valuesAnalysis.getAttributeAnalyses().get( position ).getDirtynessStatus(),
+				session
+		);
+
+		return createOperationGroup( valuesAnalysis, updateGroupBuilder.buildMutationGroup() );
+	}
+
+	private TableMutationBuilder<?> createTableUpdateBuilder(EntityTableMapping tableMapping) {
+		final var delegate =
+				tableMapping.isIdentifierTable()
+						? entityPersister().getUpdateDelegate()
+						: null;
+		return delegate != null
+				? delegate.createTableMutationBuilder( tableMapping.getInsertExpectation(), factory() )
+				: newTableUpdateBuilder( tableMapping );
+	}
+
+	protected <O extends MutationOperation> AbstractTableUpdateBuilder<O> newTableUpdateBuilder(EntityTableMapping tableMapping) {
+		return new TableUpdateBuilderStandard<>( entityPersister(), tableMapping, factory() );
+	}
+
+	private void applyTableUpdateDetails(
+			Object entity,
+			Object rowId,
+			MutationGroupBuilder updateGroupBuilder,
+			Object[] oldValues,
+			UpdateValuesAnalysisImpl updateValuesAnalysis,
+			DirtinessChecker dirtinessChecker,
+			SharedSessionContractImplementor session) {
+		final var persister = entityPersister();
+		final var versionMapping = persister.getVersionMapping();
+		final var attributeMappings = persister.getAttributeMappings();
+		final boolean[] versionability = persister.getPropertyVersionability();
+		final var optimisticLockStyle = persister.optimisticLockStyle();
+
+		updateGroupBuilder.forEachTableMutationBuilder( (builder) -> {
+			final var tableMapping = (EntityTableMapping) builder.getMutatingTable().getTableMapping();
+
+			for ( final int attributeIndex : tableMapping.getAttributeIndexes() ) {
+				final var attributeMapping = attributeMappings.get( attributeIndex );
+				final var attributeAnalysis = updateValuesAnalysis.attributeAnalyses.get( attributeIndex );
+
+				if ( attributeAnalysis.includeInSet() ) {
+					assert updateValuesAnalysis.tablesNeedingUpdate.contains( tableMapping )
+						|| updateValuesAnalysis.tablesNeedingDynamicUpdate.contains( tableMapping );
+					applyAttributeUpdateDetails(
+							entity,
+							updateGroupBuilder,
+							dirtinessChecker,
+							versionMapping,
+							attributeIndex,
+							attributeMapping,
+							(TableUpdateBuilder<?>) builder,
+							session
+					);
+				}
+
+				if ( attributeAnalysis.includeInLocking() ) {
+					final boolean includeRestriction = includeInRestriction(
+							oldValues,
+							dirtinessChecker,
+							versionMapping,
+							versionability,
+							optimisticLockStyle,
+							attributeIndex,
+							attributeMapping,
+							attributeAnalysis
+					);
+
+					if ( includeRestriction ) {
+						applyAttributeLockingDetails(
+								oldValues,
+								session,
+								attributeIndex,
+								attributeMapping,
+								(TableUpdateBuilder<?>) builder
+						);
+					}
+				}
+			}
+		} );
+
+		updateGroupBuilder.forEachTableMutationBuilder( (builder) -> {
+			final var tableMapping = (EntityTableMapping) builder.getMutatingTable().getTableMapping();
+			final var tableUpdateBuilder = (TableUpdateBuilder<?>) builder;
+			applyKeyRestriction( rowId, persister, tableUpdateBuilder, tableMapping );
+			applyPartitionKeyRestriction( tableUpdateBuilder );
+		} );
+	}
+
+	private static void applyAttributeLockingDetails(
+			Object[] oldValues,
+			SharedSessionContractImplementor session,
+			int attributeIndex,
+			AttributeMapping attributeMapping,
+			TableUpdateBuilder<?> tableUpdateBuilder) {
+		if ( oldValues == null ) {
+			tableUpdateBuilder.addOptimisticLockRestrictions( attributeMapping );
+		}
+		else if ( tableUpdateBuilder.getOptimisticLockBindings() != null ) {
+			attributeMapping.decompose(
+					oldValues[attributeIndex],
+					tableUpdateBuilder.getOptimisticLockBindings(),
+					session
+			);
+		}
+	}
+
+	private static boolean includeInRestriction(
+			Object[] oldValues,
+			DirtinessChecker dirtinessChecker,
+			EntityVersionMapping versionMapping,
+			boolean[] versionability,
+			OptimisticLockStyle optimisticLockStyle,
+			int attributeIndex,
+			AttributeMapping attributeMapping,
+			AttributeAnalysis attributeAnalysis) {
+
+		if ( optimisticLockStyle == OptimisticLockStyle.VERSION
+				&& versionMapping != null
+				&& attributeMapping == versionMapping.getVersionAttribute() ) {
+			return true;
+		}
+		else if ( oldValues == null ) {
+			return false;
+		}
+		else if ( optimisticLockStyle == OptimisticLockStyle.ALL ) {
+			return versionability[attributeIndex];
+		}
+		else if ( optimisticLockStyle == DIRTY ) {
+			if ( dirtinessChecker == null ) {
+				// this should indicate creation of the "static" update group.
+				return false;
+			}
+			else {
+				return versionability[attributeIndex]
+					&& attributeAnalysis.includeInLocking()
+					&& dirtinessChecker.isDirty( attributeIndex, attributeMapping ).isDirty();
+			}
+		}
+		else {
+			return false;
+		}
+	}
+
+	private void applyAttributeUpdateDetails(
+			Object entity,
+			MutationGroupBuilder updateGroupBuilder,
+			DirtinessChecker dirtinessChecker,
+			EntityVersionMapping versionMapping,
+			int attributeIndex,
+			AttributeMapping attributeMapping,
+			TableUpdateBuilder<?> tableUpdateBuilder,
+			SharedSessionContractImplementor session) {
+		final var generator = attributeMapping.getGenerator();
+		if ( generator instanceof OnExecutionGenerator onExecutionGenerator
+				&& hasValueGenerationOnExecution( entity, session, onExecutionGenerator, EventType.UPDATE ) ) {
+			handleValueGeneration( attributeMapping, updateGroupBuilder, onExecutionGenerator, EventType.UPDATE );
+		}
+		else if ( versionMapping != null
+				&& versionMapping.getVersionAttribute() == attributeMapping) {
+			tableUpdateBuilder.addValueColumn( versionMapping.getVersionAttribute() );
+		}
+		else {
+			final boolean includeInSet = !entityPersister().isDynamicUpdate()
+					|| dirtinessChecker == null
+					|| dirtinessChecker.isDirty( attributeIndex, attributeMapping ).isDirty();
+			if ( includeInSet ) {
+				forEachUpdatable( attributeMapping, tableUpdateBuilder );
+			}
+		}
+	}
+
+	protected void forEachUpdatable(AttributeMapping attributeMapping, TableUpdateBuilder<?> tableUpdateBuilder) {
+		attributeMapping.forEachUpdatable( tableUpdateBuilder );
+	}
+
+	/**
+	 * Contains the aggregated analysis of the update values to determine
+	 * what SQL UPDATE statement(s) should be used to update the entity
+	 * and to drive parameter binding
+	 */
+	protected class UpdateValuesAnalysisImpl implements UpdateValuesAnalysis {
+		private final Object[] values;
+		private final int[] dirtyAttributeIndexes;
+		private final InclusionChecker dirtinessChecker;
+
+		private final TableSet tablesNeedingUpdate = new TableSet();
+		private final TableSet tablesNeedingDynamicUpdate = new TableSet();
+		private final TableSet tablesWithNonNullValues = new TableSet();
+		private final TableSet tablesWithPreviousNonNullValues = new TableSet();
+
+		private final List<AttributeAnalysis> attributeAnalyses = new ArrayList<>();
+
+		// transient values as we perform the analysis
+		private AttributeAnalysisImplementor currentAttributeAnalysis;
+		private boolean dirtyChecked = false;
+		private boolean nullChecked = false;
+
+		public UpdateValuesAnalysisImpl(
+				Object[] values,
+				Object[] oldValues,
+				int[] dirtyAttributeIndexes,
+				InclusionChecker dirtinessChecker,
+				Object rowId,
+				boolean forceDynamicUpdate) {
+			this.values = values;
+			this.dirtyAttributeIndexes = dirtyAttributeIndexes;
+			this.dirtinessChecker = dirtinessChecker;
+
+			entityPersister().forEachMutableTable( (tableMapping) -> {
+				if ( values == null ) {
+					tablesWithNonNullValues.add( tableMapping );
+				}
+				else {
+					for ( final int attributeIndex : tableMapping.getAttributeIndexes() ) {
+						if ( values[attributeIndex] != null ) {
+							tablesWithNonNullValues.add( tableMapping );
+							break;
+						}
+					}
+				}
+
+				if ( dirtyAttributeIndexes == null && tableMapping.hasColumns() ) {
+					tablesNeedingUpdate.add( tableMapping );
+				}
+
+				if ( oldValues == null ) {
+					tablesWithPreviousNonNullValues.add( tableMapping );
+				}
+				else {
+					for ( final int attributeIndex : tableMapping.getAttributeIndexes() ) {
+						if ( oldValues[attributeIndex] != null ) {
+							tablesWithPreviousNonNullValues.add( tableMapping );
+							break;
+						}
+					}
+				}
+
+				if ( tableMapping.getUpdateDetails().getCustomSql() == null ) {
+					// we should only dynamically update tables w/o custom update sql
+					if ( forceDynamicUpdate ) {
+						tablesNeedingDynamicUpdate.add( tableMapping );
+					}
+					else if ( dirtyAttributeIndexes != null ) {
+						if ( entityPersister().isDynamicUpdate()
+								|| entityPersister().optimisticLockStyle() == DIRTY ) {
+							tablesNeedingDynamicUpdate.add( tableMapping );
+						}
+						else if ( rowId == null && needsRowId( entityPersister(), tableMapping ) ) {
+							tablesNeedingDynamicUpdate.add( tableMapping );
+						}
+					}
+				}
+			} );
+		}
+
+		@Override
+		public Object[] getValues() {
+			return values;
+		}
+
+		@Override
+		public TableSet getTablesNeedingUpdate() {
+			return tablesNeedingUpdate;
+		}
+
+		@Override
+		public TableSet getTablesWithNonNullValues() {
+			return tablesWithNonNullValues;
+		}
+
+		@Override
+		public TableSet getTablesWithPreviousNonNullValues() {
+			return tablesWithPreviousNonNullValues;
+		}
+
+		@Override
+		public List<AttributeAnalysis> getAttributeAnalyses() {
+			return attributeAnalyses;
+		}
+
+		/**
+		 * Basically, can the ({@linkplain UpdateCoordinatorStandard#staticUpdateGroup static update group}
+		 * be used or is a dynamic update needed.
+		 */
+		public boolean needsDynamicUpdate() {
+			return !tablesNeedingDynamicUpdate.isEmpty();
+		}
+
+		public TableSet getTablesNeedingDynamicUpdate() {
+			return tablesNeedingDynamicUpdate;
+		}
+
+		/**
+		 * Callback at start of processing an attribute
+		 */
+		public void startingAttribute(AttributeMapping attribute) {
+			if ( attribute.getJdbcTypeCount() < 1
+					|| !( attribute instanceof SingularAttributeMapping singularAttributeMapping ) ) {
+				currentAttributeAnalysis = new SkippedAttributeAnalysis( attribute );
+			}
+			else {
+				currentAttributeAnalysis = new IncludedAttributeAnalysis( singularAttributeMapping );
+				if ( dirtyAttributeIndexes == null
+						|| contains( dirtyAttributeIndexes, attribute.getStateArrayPosition() ) ) {
+					currentAttributeAnalysis.markDirty( dirtyAttributeIndexes != null );
+				}
+			}
+
+			attributeAnalyses.add( currentAttributeAnalysis );
+		}
+
+		public void finishedAttribute(AttributeMapping attribute) {
+			assert currentAttributeAnalysis.getAttribute() == attribute;
+			currentAttributeAnalysis = null;
+			dirtyChecked = false;
+			nullChecked = false;
+		}
+
+		/**
+		 * Callback to register the setting of a column value
+		 */
+		public void registerColumnSet(EntityTableMapping table, String readExpression, String writeExpression) {
+			final var includedAttributeAnalysis = (IncludedAttributeAnalysis) currentAttributeAnalysis;
+			includedAttributeAnalysis.columnValueAnalyses.add( new ColumnSetAnalysis( readExpression, writeExpression ) );
+
+			if ( !dirtyChecked ) {
+				final var attribute = includedAttributeAnalysis.attribute;
+				if ( dirtinessChecker.include( attribute.getStateArrayPosition(), attribute ) ) {
+					tablesNeedingUpdate.add( table );
+				}
+
+				dirtyChecked = true;
+			}
+
+			if ( values != null && !nullChecked ) {
+				final int attributePosition = currentAttributeAnalysis.getAttribute().getStateArrayPosition();
+				if ( values[attributePosition] != null ) {
+					tablesWithNonNullValues.add( table );
+				}
+				nullChecked = true;
+			}
+		}
+
+		public void registerColumnOptLock(EntityTableMapping table, String readExpression, Object lockValue) {
+			final var attributeAnalysis = (IncludedAttributeAnalysis) currentAttributeAnalysis;
+			attributeAnalysis.columnLockingAnalyses.add( new ColumnLockingAnalysis( readExpression, lockValue ) );
+
+			if ( dirtyAttributeIndexes != null && lockValue == null ) {
+				// we need to use `IS NULL` as opposed to `= ?` w/ NULL
+				tablesNeedingDynamicUpdate.add( table );
+			}
+		}
+
+		public void registerValueGeneratedInSqlNoWrite() {
+			final var attributeAnalysis = (IncludedAttributeAnalysis) currentAttributeAnalysis;
+			attributeAnalysis.setValueGeneratedInSqlNoWrite( true );
+		}
+	}
+
+	/**
+	 * Local extension to AttributeAnalysis
+	 */
+	private interface AttributeAnalysisImplementor extends AttributeAnalysis {
+		/**
+		 * @param asCertain set to true when we're sure, false when we merely need to treat the attribute
+		 * as dirty but couldn't actually run the comparison.
+		 * Once it's marked at least once "with certainty", there is no option to revert to a lower state.
+		 */
+		void markDirty(boolean asCertain);
+	}
+
+	/**
+	 * Local AttributeAnalysis implementation for use when the attribute is
+	 * to be completely skipped.  Avoids having to define the collections
+	 * needed to fully implement AttributeAnalysis.
+	 *
+	 * @see IncludedAttributeAnalysis
+	 */
+	private static class SkippedAttributeAnalysis implements AttributeAnalysisImplementor {
+		private final AttributeMapping attributeMapping;
+
+		public SkippedAttributeAnalysis(AttributeMapping attributeMapping) {
+			this.attributeMapping = attributeMapping;
+		}
+
+		@Override
+		public AttributeMapping getAttribute() {
+			return attributeMapping;
+		}
+
+		@Override
+		public boolean includeInSet() {
+			return false;
+		}
+
+		@Override
+		public boolean includeInLocking() {
+			return false;
+		}
+
+		@Override
+		public DirtynessStatus getDirtynessStatus() {
+			return DirtynessStatus.NOT_DIRTY;
+		}
+
+		@Override
+		public void markDirty(boolean certainty) {
+		}
+
+		@Override
+		public String toString() {
+			return String.format(
+					Locale.ROOT,
+					"SkippedAttributeAnalysis(`%s`)",
+					attributeMapping.getNavigableRole().getFullPath()
+			);
+		}
+	}
+
+	/**
+	 * Local AttributeAnalysis implementation
+	 */
+	private static class IncludedAttributeAnalysis implements AttributeAnalysisImplementor {
+		private final SingularAttributeMapping attribute;
+
+		private final List<ColumnSetAnalysis> columnValueAnalyses;
+		private final List<ColumnLockingAnalysis> columnLockingAnalyses;
+
+		private DirtynessStatus dirty = DirtynessStatus.NOT_DIRTY;
+		private boolean valueGeneratedInSqlNoWrite;
+
+		public IncludedAttributeAnalysis(SingularAttributeMapping attribute) {
+			this.attribute = attribute;
+
+			this.columnValueAnalyses = arrayList( attribute.getJdbcTypeCount() );
+			this.columnLockingAnalyses = arrayList( attribute.getJdbcTypeCount() );
+		}
+
+		@Override
+		public SingularAttributeMapping getAttribute() {
+			return attribute;
+		}
+
+		@Override
+		public boolean includeInSet() {
+			return !columnValueAnalyses.isEmpty();
+		}
+
+		@Override
+		public boolean includeInLocking() {
+			return !columnLockingAnalyses.isEmpty();
+		}
+
+		@Override
+		public DirtynessStatus getDirtynessStatus() {
+			return dirty;
+		}
+
+		@Internal
+		@Override
+		public void markDirty(boolean certain) {
+			if ( certain ) {
+				this.dirty = DirtynessStatus.DIRTY;
+			}
+			else if ( this.dirty == DirtynessStatus.NOT_DIRTY ) {
+				this.dirty = DirtynessStatus.CONSIDER_LIKE_DIRTY;
+			}
+		}
+
+		public boolean isValueGeneratedInSqlNoWrite() {
+			return valueGeneratedInSqlNoWrite;
+		}
+
+		public void setValueGeneratedInSqlNoWrite(boolean valueGeneratedInSqlNoWrite) {
+			this.valueGeneratedInSqlNoWrite = valueGeneratedInSqlNoWrite;
+		}
+
+		@Override
+		public String toString() {
+			return String.format(
+					Locale.ROOT,
+					"IncludedAttributeAnalysis(`%s`)",
+					attribute.getNavigableRole().getFullPath()
+			);
+		}
+	}
+
+	private static class ColumnSetAnalysis {
+		private final String readExpression;
+		private final String writeExpression;
+
+		public ColumnSetAnalysis(String readExpression, String writeExpression) {
+			this.readExpression = readExpression;
+			this.writeExpression = writeExpression;
+		}
+
+		@SuppressWarnings("unused")
+		public String getReadExpression() {
+			return readExpression;
+		}
+
+		@SuppressWarnings("unused")
+		public String getWriteExpression() {
+			return writeExpression;
+		}
+	}
+
+	private static class ColumnLockingAnalysis {
+		private final String readExpression;
+		private final Object lockValue;
+
+		public ColumnLockingAnalysis(String readExpression, Object lockValue) {
+			assert readExpression != null;
+			assert !readExpression.equals( "?" );
+
+			this.readExpression = readExpression;
+			this.lockValue = lockValue;
+		}
+
+		public String getReadExpression() {
+			return readExpression;
+		}
+
+		public Object getLockValue() {
+			return lockValue;
+		}
+	}
+
+	protected MutationOperationGroup buildStaticUpdateGroup() {
+		final var persister = entityPersister();
+		final var valuesAnalysis = analyzeUpdateValues(
+				null,
+				null,
+				null,
+				null,
+				null,
+				(index, attribute) -> includeInStaticUpdate( index, attribute, persister.getPropertyUpdateability() ),
+				(index,attribute) ->
+						switch ( persister.optimisticLockStyle() ) {
+							case ALL -> true;
+							case VERSION -> {
+								final var versionMapping = persister.getVersionMapping();
+								yield versionMapping != null && attribute == versionMapping.getVersionAttribute();
+							}
+							default -> false;
+						},
+				(index,attribute) -> true,
+				false,
+				"", // pass anything here to generate the row id restriction if possible
+				false,
+				null
+		);
+
+		final var updateGroupBuilder = new MutationGroupBuilder( MutationType.UPDATE, persister );
+
+		persister.forEachMutableTable( (tableMapping) -> {
+			// NOTE: TableUpdateBuilderStandard handles custom SQL update mappings
+			updateGroupBuilder.addTableDetailsBuilder( createTableUpdateBuilder( tableMapping ) );
+		} );
+
+		// next, iterate each attribute and build the SET and WHERE clauses
+		applyTableUpdateDetails(
+				null,
+				// row-id
+				"", // pass anything here to generate the row id restriction if possible
+				// the "collector"
+				updateGroupBuilder,
+				// oldValues
+				null,
+				valuesAnalysis,
+				(position, attribute) -> valuesAnalysis.getAttributeAnalyses().get( position ).getDirtynessStatus(),
+				// session
+				null
+		);
+
+		// build the mutation-group (SQL AST) and convert it into a jdbc-operations (SQL String, etc) group
+		return createOperationGroup( valuesAnalysis, updateGroupBuilder.buildMutationGroup() );
+	}
+
+	protected boolean includeInStaticUpdate(
+			int index,
+			AttributeMapping attribute,
+			boolean[] propertyUpdateability) {
+		return isValueGenerationOnUpdateInSql( attribute.getGenerator(), dialect() )
+			|| propertyUpdateability[index];
+	}
+
+	private MutationOperationGroup buildVersionUpdateGroup() {
+		final var versionMapping = entityPersister().getVersionMapping();
+		if ( versionMapping == null ) {
+			return null;
+		}
+		else {
+			final var identifierTableMapping = entityPersister().getIdentifierTableMapping();
+			final AbstractTableUpdateBuilder<JdbcMutationOperation> updateBuilder =
+					newTableUpdateBuilder( identifierTableMapping );
+
+			updateBuilder.setSqlComment( "forced version increment for " + entityPersister().getRolePath() );
+
+			updateBuilder.addValueColumn( versionMapping );
+
+			updateBuilder.addKeyRestrictionsLeniently( identifierTableMapping.getKeyMapping() );
+
+			applyVersionOptimisticLocking( updateBuilder );
+			applyPartitionKeyRestriction( updateBuilder );
+
+			//noinspection resource
+			final var jdbcMutation = factory()
+					.getJdbcServices()
+					.getJdbcEnvironment()
+					.getSqlAstTranslatorFactory()
+					.buildModelMutationTranslator( updateBuilder.buildMutation(), factory() )
+					.translate( null, MutationQueryOptions.INSTANCE );
+
+			return MutationOperationGroupFactory.singleOperation( MutationType.UPDATE, entityPersister(), jdbcMutation );
+		}
+	}
+
+	@FunctionalInterface
+	protected interface InclusionChecker {
+		boolean include(int position, SingularAttributeMapping attribute);
+	}
+
+	@FunctionalInterface
+	protected interface DirtinessChecker {
+		AttributeAnalysis.DirtynessStatus isDirty(int position, AttributeMapping attribute);
+	}
+
+	public boolean hasLazyDirtyFields(EntityPersister persister,  int[] dirtyFields) {
+		final var propertyLaziness = persister.getPropertyLaziness();
+		for ( int dirtyField : dirtyFields ) {
+			if ( propertyLaziness[dirtyField] ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public EntityTableMapping physicalTableMappingForMutation(
+			EntityPersister persister, SelectableMapping selectableMapping) {
+		final String tableNameForMutation = persister.physicalTableNameForMutation( selectableMapping );
+		for ( var tableMapping : persister.getTableMappings() ) {
+			if ( tableNameForMutation.equals( tableMapping.getTableName() ) ) {
+				return tableMapping;
+			}
+		}
+
+		throw new IllegalArgumentException( "Unable to resolve TableMapping for selectable - " + selectableMapping );
+	}
+
+	@Override
+	public String toString() {
+		return "UpdateCoordinatorStandard(" + entityPersister().getEntityName() + ")";
+	}
+}
