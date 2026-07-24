@@ -56,7 +56,7 @@ hibernate-core:test 报告总 skipped 中，我方新增约 65 个，其余为 H
 
 ---
 
-## 五、验证
+## 四、验证
 
 - 命令：`.\gradlew clean hibernate-core:test -Pdb=gaussdb`
 - 环境：A 模式 a_db，远程 GaussDB 505.2.1 08000SPC（115.120.232.30:8000）
@@ -64,7 +64,7 @@ hibernate-core:test 报告总 skipped 中，我方新增约 65 个，其余为 H
 
 ---
 
-## 六、结论
+## 五、结论
 
 1. **A 模式功能基本完整**：核心限制仅 ON CONFLICT（可用 ON DUPLICATE KEY 替代，仅含主键表 do-nothing upsert 除外）；hypothetical-set 仅窗口支持（within group 不支持）；struct 存储过程 / 保留字 end / json= 为 M+A 共同限制。
 2. M 模式限制较多（MySQL 兼容内核相对 PG 内核缺失），均为内核限制，A 模式不受影响。
