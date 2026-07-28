@@ -69,15 +69,15 @@ ext {
             ],
             gaussdb: [
                     'db.dialect'         : 'org.hibernate.community.dialect.GaussDBDialect',
-                    'jdbc.driver'        : 'org.postgresql.Driver',
+                    'jdbc.driver'        : 'com.huawei.gaussdb.jdbc.Driver',
                     'jdbc.user'          : 'root',
                     'jdbc.pass'          : 'Gaussdb@123',
                     // gsjdbc4 (org.postgresql.Driver) is used because the official gaussdbjdbc driver
                     // is unstable under parallel tests (connection reset / EOF).
                     // The oidToPgName incompatibility is handled in SharedDriverManagerConnectionProvider
                     // via findField() which supports the underscore-prefixed field names.
-                    'jdbc.url'           : 'jdbc:postgresql://' + dbHost + '/a_db?preparedStatementCacheQueries=0&batchMode=off',
-                    'jdbc.datasource'    : 'org.postgresql.Driver',
+                    'jdbc.url'           : 'jdbc:gaussdb://' + dbHost + '/a_db?preparedStatementCacheQueries=0&batchMode=off',
+                    'jdbc.datasource'    : 'com.huawei.gaussdb.jdbc.Driver',
                     'connection.init_sql' : ''
             ],
             edb_ci : [
