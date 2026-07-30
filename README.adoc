@@ -6,5 +6,34 @@ Hibernate 是使用最广泛的 JPA 实现。本仓库在 Hibernate ORM 7.4.1.Fi
 
 本文主要提供 Hibernate 连接 GaussDB 相关的方言适配说明。详细的适配改动与仍不支持的功能见以下文档:
 
-* link:gaussdb-dialect-adaptation-diff.md[适配差异说明] —— 相对官方 7.4.1 的改动(侧重 A 模式)
-* link:gaussdb-skipped-tests.md[GaussDB 方言适配总结(仍不支持功能)] —— A/M 模式仍不支持的功能与跳过用例
+* link:tasks/gaussdb-dialect-adaptation-diff.md[适配差异说明] —— 相对官方 7.4.1 的改动(侧重 A 模式)
+* link:tasks/gaussdb-skipped-tests.md[GaussDB 方言适配总结(仍不支持功能)] —— A/M 模式仍不支持的功能与跳过用例
+
+== 运行测试
+
+GaussDB 连接信息在以下两处配置:
+
+* `gradle.properties` —— `dbHost`(GaussDB 地址:端口)、`db`(默认 `gaussdb`)
+* `local-build-plugins/src/main/groovy/local.databases.gradle` 的 `gaussdb` 配置块 —— `jdbc.user`、`jdbc.pass`、`jdbc.url`(库名,默认 `a_db`)、`jdbc.driver`
+
+按实际环境修改以上连接信息(集中式场景建议在 `jdbc.url` 增加 `&targetServerType=master`,分布式场景增加 `&autoBalance=true`),然后执行全量测试:
+
+[source]
+----
+./gradlew clean hibernate-core:test -Pdb=gaussdb
+----
+
+Windows 下使用 `.\gradlew`。`dbHost` 也可通过命令行临时覆盖:
+
+[source]
+----
+./gradlew clean hibernate-core:test -Pdb=gaussdb -DdbHost=<host:port>
+----
+
+运行单个测试类(以 GaussDB 存储过程测试为例):
+
+[source]
+----
+./gradlew :hibernate-community-dialects:test --tests "org.hibernate.community.dialect.procedure.GaussDBStoredProcedureTest"
+----
+
