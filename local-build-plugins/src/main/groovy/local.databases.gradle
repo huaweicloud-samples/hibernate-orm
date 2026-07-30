@@ -70,8 +70,8 @@ ext {
             gaussdb: [
                     'db.dialect'         : 'org.hibernate.community.dialect.GaussDBDialect',
                     'jdbc.driver'        : 'com.huawei.gaussdb.jdbc.Driver',
-                    'jdbc.user'          : 'root',
-                    'jdbc.pass'          : 'Gaussdb@123',
+                    'jdbc.user'          : '<your-user>',
+                    'jdbc.pass'          : '<your-password>',
                     // gsjdbc4 (org.postgresql.Driver) is used because the official gaussdbjdbc driver
                     // is unstable under parallel tests (connection reset / EOF).
                     // The oidToPgName incompatibility is handled in SharedDriverManagerConnectionProvider

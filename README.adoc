@@ -1,20 +1,21 @@
 = Hibernate 连接 GaussDB 使用指南
 
-Hibernate 是使用最广泛的 JPA 实现。本仓库在 Hibernate ORM 7.4.1.Final 基线上完成 GaussDB 方言适配,支持集中式/分布式,A 模式(Oracle 兼容)与 M 模式(MySQL 兼容),配套 gsjdbc4 驱动全量测试通过。
+Hibernate 是使用最广泛的 JPA 实现。本仓库在 Hibernate ORM 7.4.1.Final 基线上完成 GaussDB 方言适配,支持集中式,A 模式(Oracle 兼容)与 M 模式(MySQL 兼容),配套 gsjdbc4 驱动全量测试通过。
 
 官方开发指南参考:https://hibernate.org/orm/documentation/7.4/[Hibernate ORM Documentation]
 
 本文主要提供 Hibernate 连接 GaussDB 相关的方言适配说明。详细的适配改动与仍不支持的功能见以下文档:
 
-* link:tasks/gaussdb-dialect-adaptation-diff.md[适配差异说明] —— 相对官方 7.4.1 的改动(侧重 A 模式)
-* link:tasks/gaussdb-skipped-tests.md[GaussDB 方言适配总结(仍不支持功能)] —— A/M 模式仍不支持的功能与跳过用例
+* link:gaussdb-dialect-adaptation-diff.md[适配差异说明] —— 相对官方 7.4.1 的改动
+* link:gaussdb-skipped-tests.md[GaussDB 方言适配总结(仍不支持功能)] —— A/M 模式仍不支持的功能与跳过用例
 
 == 运行测试
 
-GaussDB 连接信息在以下两处配置:
+GaussDB 连接信息在以下三处配置:
 
 * `gradle.properties` —— `dbHost`(GaussDB 地址:端口)、`db`(默认 `gaussdb`)
 * `local-build-plugins/src/main/groovy/local.databases.gradle` 的 `gaussdb` 配置块 —— `jdbc.user`、`jdbc.pass`、`jdbc.url`(库名,默认 `a_db`)、`jdbc.driver`
+* `local-build-plugins/src/main/groovy/local.java-module.gradle` —— `hibernate.dialect.gaussdb.compatibility_mode`(默认 `A`;若使用 M 模式改为 `M`)
 
 按实际环境修改以上连接信息(集中式场景建议在 `jdbc.url` 增加 `&targetServerType=master`,分布式场景增加 `&autoBalance=true`),然后执行全量测试:
 
