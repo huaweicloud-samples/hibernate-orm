@@ -240,6 +240,6 @@ public class GaussDBFunctionRegistry {
 	}
 
 	public void jsonObject_gaussdb() {
-		functionRegistry.register( "json_object", new GaussDBJsonObjectFunction( typeConfiguration ) );
+		functionRegistry.register( "json_object", new GaussDBJsonObjectFunction( functionContributions.getDialect(), typeConfiguration ) );
 	}
 }

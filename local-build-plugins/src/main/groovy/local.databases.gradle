@@ -71,11 +71,11 @@ ext {
             gaussdb: [
                     'db.dialect'         : 'org.hibernate.community.dialect.GaussDBDialect',
                     'jdbc.driver'        : 'com.huawei.gaussdb.jdbc.Driver',
-                    'jdbc.user'          : 'hibernate_orm_test',
-                    'jdbc.pass'          : 'Hibernate_orm_test@1234',
+                    'jdbc.user'          : 'root',
+                    'jdbc.pass'          : 'Gaussdb@123',
                     // Disable prepared statement caching to avoid issues with changing schemas
                     // Make batch verification work, see https://bbs.huaweicloud.com/forum/thread-02104174303512776081-1-1.html
-                    'jdbc.url'           : 'jdbc:gaussdb://' + dbHost + '/hibernate_orm_test?currentSchema=test&preparedStatementCacheQueries=0&batchMode=off',
+                    'jdbc.url'           : 'jdbc:gaussdb://' + dbHost + '/a_db?currentSchema=test&preparedStatementCacheQueries=0&batchMode=off&targetServerType=master',
                     'jdbc.datasource'    : 'com.huawei.gaussdb.jdbc.Driver',
                     'connection.init_sql': ''
             ],
